@@ -13,6 +13,31 @@ Built-in adapters:
 The default mode is a read-only preview. No credentials, settings, plugins,
 caches, lock files, or SQLite databases are copied between machines.
 
+## Installation
+
+Install the latest release from [crates.io](https://crates.io/crates/agent-sync):
+
+```console
+cargo install agent-sync --locked
+```
+
+This requires Rust 1.85 or newer. Prebuilt binaries for macOS and Linux on
+arm64 and x86_64 are also available from
+[GitHub Releases](https://github.com/lidongpeng36/agent-sync/releases/latest),
+with a SHA-256 checksum beside every archive.
+
+To build the current source instead:
+
+```console
+git clone https://github.com/lidongpeng36/agent-sync.git
+cd agent-sync
+cargo install --path . --locked
+```
+
+`ssh` and `rsync` must be available locally. Claude writer detection also uses
+`lsof` on both peers, while Codex catalog repair uses `codex app-server` on both
+peers.
+
 ## Usage
 
 ```console
@@ -94,6 +119,16 @@ cargo test --all-features
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the adapter boundary and invariants.
 
 ## 中文快速开始
+
+使用 Cargo 安装：
+
+```console
+cargo install agent-sync --locked
+```
+
+也可以从
+[GitHub Releases](https://github.com/lidongpeng36/agent-sync/releases/latest)
+下载适用于 macOS/Linux、arm64/x86_64 的预编译包及 SHA-256 校验文件。
 
 默认命令只生成计划，不写文件：
 
