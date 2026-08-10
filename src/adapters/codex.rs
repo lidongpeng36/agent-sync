@@ -216,9 +216,14 @@ fn excluded(p: &Path, r: ResourceSelection) -> bool {
         n.as_deref(),
         Some("sessions" | "archived_sessions" | "history.jsonl" | "session_index.jsonl")
     );
+    let private_memory_metadata = memory
+        && p.components()
+            .skip(1)
+            .any(|c| c.as_os_str() == ".git" || c.as_os_str() == ".omx");
     (!r.memory() && memory)
         || (!r.sessions() && session)
         || (!memory && !session)
+        || private_memory_metadata
         || p.to_string_lossy().contains("sync-backups")
 }
 
@@ -975,5 +980,23 @@ mod tests {
         );
         assert!(merged.contains("longer details"));
         assert!(!merged.contains("\nshort\n"));
+    }
+
+    #[test]
+    fn final_verification_ignores_private_memory_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        let actual = temp.path().join("actual");
+        fs::create_dir_all(stage.join("memories")).unwrap();
+        fs::create_dir_all(actual.join("memories/.git")).unwrap();
+        fs::create_dir_all(actual.join("memories/.omx")).unwrap();
+        fs::create_dir_all(actual.join("memories/nested/.git")).unwrap();
+        fs::write(stage.join("memories/MEMORY.md"), "shared\n").unwrap();
+        fs::write(actual.join("memories/MEMORY.md"), "shared\n").unwrap();
+        fs::write(actual.join("memories/.git/config"), "private\n").unwrap();
+        fs::write(actual.join("memories/.omx/state"), "private\n").unwrap();
+        fs::write(actual.join("memories/nested/.git/config"), "private\n").unwrap();
+
+        verify_selected(&stage, &actual, ResourceSelection::Memory, "local").unwrap();
     }
 }
