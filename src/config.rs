@@ -12,6 +12,7 @@ pub struct Config {
     #[serde(default = "version")]
     version: u32,
     default_peer: Option<String>,
+    conflict_strategy: Option<ConflictStrategy>,
     #[serde(default)]
     peers: BTreeMap<String, Peer>,
     #[serde(default)]
@@ -141,6 +142,7 @@ impl Config {
         self.agents
             .get(&kind.to_string())
             .and_then(|agent| agent.conflict_strategy)
+            .or(self.conflict_strategy)
             .unwrap_or_default()
     }
 }
@@ -183,11 +185,11 @@ mod tests {
     }
 
     #[test]
-    fn conflict_strategy_defaults_to_merge_and_can_be_configured() {
+    fn conflict_strategy_defaults_to_ask_and_can_be_configured() {
         let default = Config::default();
         assert_eq!(
             default.conflict_strategy(AgentKind::Claude),
-            ConflictStrategy::Merge
+            ConflictStrategy::Ask
         );
 
         let configured: Config = toml::from_str(
@@ -201,6 +203,31 @@ mod tests {
         assert_eq!(
             configured.conflict_strategy(AgentKind::Claude),
             ConflictStrategy::Local
+        );
+
+        let global: Config = toml::from_str(
+            r#"
+            version = 1
+            conflict_strategy = "remote"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            global.conflict_strategy(AgentKind::Claude),
+            ConflictStrategy::Remote
+        );
+
+        let legacy: Config = toml::from_str(
+            r#"
+            version = 1
+            [agents.claude]
+            conflict_strategy = "merge"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.conflict_strategy(AgentKind::Claude),
+            ConflictStrategy::Ask
         );
     }
 

@@ -48,17 +48,17 @@ pub struct CodexPrepared {
 
 pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
     println!(
-        "# agent-sync: agent=codex peer={} mode={}",
+        "# agent-sync: agent=codex peer={} status={}",
         prepared.report.peer,
         if prepared.report.blockers.is_empty() {
             "ready"
         } else {
-            "blocked"
+            "action-required"
         }
     );
     for blocker in &prepared.report.blockers {
         println!(
-            "# BLOCKED [{}] {}: {}",
+            "# ACTION REQUIRED [{}] {}: {}",
             blocker.resource, blocker.path, blocker.reason
         );
     }

@@ -113,7 +113,7 @@ struct SyncArgs {
     cache_dir: Option<PathBuf>,
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Human)]
     format: Format,
-    /// Resolve content conflicts using local, remote, or resource-aware merge behavior.
+    /// Resolve irreconcilable conflicts by asking, or by preferring local/remote changes.
     #[arg(short = 's', long, value_enum)]
     conflict_strategy: Option<ConflictStrategy>,
 }
@@ -164,14 +164,27 @@ fn confirm(args: &SyncArgs) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("--apply requires a TTY or explicit --yes");
     }
-    print!("Type apply to continue: ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    if answer.trim() != "apply" {
-        return Err(Cancelled.into());
+    loop {
+        print!("Apply these changes? [Y/n] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer)? == 0 {
+            return Err(Cancelled.into());
+        }
+        match parse_confirmation(&answer) {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(Cancelled.into()),
+            None => println!("Please answer y or n."),
+        }
     }
-    Ok(())
+}
+
+fn parse_confirmation(answer: &str) -> Option<bool> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn run() -> Result<i32> {
@@ -232,10 +245,15 @@ fn run() -> Result<i32> {
             if !args.apply {
                 return Ok(if prepared.blocked() { 2 } else { 0 });
             }
+            let required_resolution = prepared.blocked();
             adapter.resolve_interactive(&mut prepared, io::stdin().is_terminal())?;
             if prepared.blocked() {
                 prepared.print(output, &local_root)?;
                 return Ok(2);
+            }
+            if required_resolution {
+                println!("resolved plan:");
+                prepared.print(output, &local_root)?;
             }
             confirm(&args)?;
             adapter
@@ -272,6 +290,20 @@ mod tests {
             panic!("expected sync command");
         };
         assert_eq!(args.conflict_strategy, Some(ConflictStrategy::Remote));
+
+        let ask =
+            Cli::try_parse_from(["agent-sync", "sync", "claude", "mini", "-s", "ask"]).unwrap();
+        let Command::Sync(args) = ask.command else {
+            panic!("expected sync command");
+        };
+        assert_eq!(args.conflict_strategy, Some(ConflictStrategy::Ask));
+
+        let legacy =
+            Cli::try_parse_from(["agent-sync", "sync", "claude", "mini", "-s", "merge"]).unwrap();
+        let Command::Sync(args) = legacy.command else {
+            panic!("expected sync command");
+        };
+        assert_eq!(args.conflict_strategy, Some(ConflictStrategy::Ask));
     }
 
     #[test]
@@ -340,5 +372,15 @@ mod tests {
         };
         assert_eq!(args.target.peer.as_deref(), Some("mini"));
         assert!(matches!(args.format, Format::Json));
+    }
+
+    #[test]
+    fn apply_confirmation_defaults_to_yes_and_accepts_common_answers() {
+        assert_eq!(parse_confirmation("\n"), Some(true));
+        assert_eq!(parse_confirmation("y"), Some(true));
+        assert_eq!(parse_confirmation("YES"), Some(true));
+        assert_eq!(parse_confirmation("n"), Some(false));
+        assert_eq!(parse_confirmation("No"), Some(false));
+        assert_eq!(parse_confirmation("apply"), None);
     }
 }

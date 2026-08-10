@@ -27,8 +27,18 @@ pub struct ClaudeAdapter;
 struct MemoryConflict {
     project: String,
     target: String,
-    local: String,
-    remote: String,
+    local_content: String,
+    remote_content: String,
+    local_index: String,
+    remote_index: String,
+    content_requires_choice: bool,
+    index_requires_choice: bool,
+}
+
+#[derive(Clone)]
+enum MemoryChoice {
+    Side(Side),
+    Edited { content: String, index: String },
 }
 
 pub struct ClaudePrepared {
@@ -39,23 +49,23 @@ pub struct ClaudePrepared {
     local_fingerprint: String,
     remote_fingerprint: String,
     conflicts: Vec<MemoryConflict>,
-    choices: BTreeMap<(String, String), Side>,
+    choices: BTreeMap<(String, String), MemoryChoice>,
     resources: ResourceSelection,
 }
 
 pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> {
     println!(
-        "# agent-sync: agent=claude peer={} mode={}",
+        "# agent-sync: agent=claude peer={} status={}",
         prepared.report.peer,
         if prepared.report.blockers.is_empty() {
             "ready"
         } else {
-            "blocked"
+            "action-required"
         }
     );
     for blocker in &prepared.report.blockers {
         println!(
-            "# BLOCKED [{}] {}: {}",
+            "# ACTION REQUIRED [{}] {}: {}",
             blocker.resource, blocker.path, blocker.reason
         );
     }
@@ -64,10 +74,99 @@ pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> 
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
     Local,
     Remote,
+}
+
+fn conflict_markers(local: &str, remote: &str, peer: &str) -> String {
+    format!(
+        "<<<<<<< LOCAL\n{}{}=======\n{}{}>>>>>>> REMOTE {peer}\n",
+        local,
+        if local.ends_with('\n') { "" } else { "\n" },
+        remote,
+        if remote.ends_with('\n') { "" } else { "\n" },
+    )
+}
+
+fn has_conflict_markers(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.starts_with("<<<<<<< ") || line == "=======" || line.starts_with(">>>>>>> ")
+    })
+}
+
+fn edit_memory_conflict(
+    conflict: &MemoryConflict,
+    root: &Path,
+    stage: &Path,
+    peer: &str,
+) -> Result<MemoryChoice> {
+    let directory = root.join(&conflict.project).join(&conflict.target);
+    private_dir(&directory)?;
+    let content_path = directory.join(&conflict.target);
+    let index_path = directory.join("MEMORY-entry.md");
+    let staged_content = stage
+        .join("projects")
+        .join(&conflict.project)
+        .join("memory")
+        .join(&conflict.target);
+    let content = if conflict.content_requires_choice {
+        conflict_markers(&conflict.local_content, &conflict.remote_content, peer)
+    } else {
+        fs::read_to_string(staged_content)?
+    };
+    let index = if conflict.index_requires_choice {
+        conflict_markers(&conflict.local_index, &conflict.remote_index, peer)
+    } else if !conflict.local_index.is_empty() {
+        conflict.local_index.clone()
+    } else {
+        conflict.remote_index.clone()
+    };
+    fs::write(&content_path, content)?;
+    fs::write(&index_path, index)?;
+
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".into());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().context("editor command is empty")?;
+    println!(
+        "opening {} and {} with {editor}",
+        content_path.display(),
+        index_path.display()
+    );
+    let status = Command::new(program)
+        .args(parts)
+        .arg(&content_path)
+        .arg(&index_path)
+        .status()
+        .with_context(|| format!("start editor {program}"))?;
+    if !status.success() {
+        bail!("editor exited with {status}");
+    }
+
+    let content = fs::read_to_string(&content_path)?;
+    let index = fs::read_to_string(&index_path)?;
+    if has_conflict_markers(&content) || has_conflict_markers(&index) {
+        bail!("conflict markers remain; resolve all <<<<<<<, =======, and >>>>>>> lines");
+    }
+    if content.trim().is_empty() {
+        bail!("edited memory content is empty");
+    }
+    synthesize_block(&content_path, &conflict.target)
+        .context("edited memory must retain non-empty name and description frontmatter")?;
+    let link = format!("]({})", conflict.target);
+    if index.matches(&link).count() != 1 {
+        bail!("edited index entry must contain exactly one {link}");
+    }
+    Ok(MemoryChoice::Edited { content, index })
 }
 
 impl Adapter for ClaudeAdapter {
@@ -137,33 +236,50 @@ impl Adapter for ClaudeAdapter {
         }
         for conflict in value.conflicts.clone() {
             println!(
-                "Claude memory index conflict [{}/{}]",
+                "Claude memory conflict [{}/{}]",
                 conflict.project, conflict.target
             );
-            println!("  [l] {}", conflict.local.replace('\n', " "));
-            println!("  [r] {}", conflict.remote.replace('\n', " "));
+            println!("  [l] {}", conflict.local_index.replace('\n', " "));
+            println!("  [r] {}", conflict.remote_index.replace('\n', " "));
             loop {
-                print!("choose l/r/q: ");
+                print!("choose [l]ocal / [r]emote / [e]dit / [q]uit: ");
                 io::stdout().flush()?;
                 let mut answer = String::new();
-                io::stdin().read_line(&mut answer)?;
+                if io::stdin().read_line(&mut answer)? == 0 {
+                    bail!("cancelled by user");
+                }
                 match answer.trim().to_ascii_lowercase().as_str() {
                     "l" | "local" => {
                         value.choices.insert(
                             (conflict.project.clone(), conflict.target.clone()),
-                            Side::Local,
+                            MemoryChoice::Side(Side::Local),
                         );
                         break;
                     }
                     "r" | "remote" => {
                         value.choices.insert(
                             (conflict.project.clone(), conflict.target.clone()),
-                            Side::Remote,
+                            MemoryChoice::Side(Side::Remote),
                         );
                         break;
                     }
+                    "e" | "edit" => match edit_memory_conflict(
+                        &conflict,
+                        &value.temp.path().join("edit"),
+                        &value.stage,
+                        &value.report.peer,
+                    ) {
+                        Ok(choice) => {
+                            value.choices.insert(
+                                (conflict.project.clone(), conflict.target.clone()),
+                                choice,
+                            );
+                            break;
+                        }
+                        Err(error) => println!("edit not accepted: {error:#}"),
+                    },
                     "q" | "quit" => bail!("cancelled by user"),
-                    _ => {}
+                    _ => println!("Please choose l, r, e, or q."),
                 }
             }
         }
@@ -175,7 +291,7 @@ impl Adapter for ClaudeAdapter {
             value.resources,
             &value.choices,
             &value.report.peer,
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )?;
         value.report = report;
         value.conflicts.clear();
@@ -451,7 +567,7 @@ fn build_stage(
     remote: &Path,
     stage: &Path,
     resources: ResourceSelection,
-    choices: &BTreeMap<(String, String), Side>,
+    choices: &BTreeMap<(String, String), MemoryChoice>,
     peer: &str,
     strategy: ConflictStrategy,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
@@ -462,7 +578,7 @@ fn build_stage_from_choices(
     remote: &Path,
     stage: &Path,
     resources: ResourceSelection,
-    choices: &BTreeMap<(String, String), Side>,
+    choices: &BTreeMap<(String, String), MemoryChoice>,
     peer: &str,
     strategy: ConflictStrategy,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
@@ -476,7 +592,7 @@ fn build_stage_full(
     remote: &Path,
     stage: &Path,
     resources: ResourceSelection,
-    choices: &BTreeMap<(String, String), Side>,
+    choices: &BTreeMap<(String, String), MemoryChoice>,
     peer: &str,
     strategy: ConflictStrategy,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
@@ -494,16 +610,18 @@ fn build_stage_full(
         let right = session_files(remote)?;
         let mut divergent_sessions = BTreeSet::new();
         for (path, local_file) in &left {
-            let Some((project, session)) = main_session_identity(path) else {
+            let Some((project, session)) = session_bundle_identity(path) else {
                 continue;
             };
             let Some(remote_file) = right.get(path) else {
                 continue;
             };
-            if local_file.sha != remote_file.sha
-                && !file_prefix(local_file, remote_file)?
-                && !file_prefix(remote_file, local_file)?
-            {
+            let is_jsonl = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
+            let compatible = local_file.sha == remote_file.sha
+                || (is_jsonl
+                    && (file_prefix(local_file, remote_file)?
+                        || file_prefix(remote_file, local_file)?));
+            if !compatible {
                 divergent_sessions.insert((project, session));
             }
         }
@@ -579,28 +697,11 @@ fn build_stage_full(
             }
         }
         for (project, session) in divergent_sessions {
-            match strategy {
-                ConflictStrategy::Local => {
-                    copy_session_bundle(local, stage, &project, &session, &session)?;
-                    report.notes.push(format!(
-                        "local session wins: projects/{project}/{session}.jsonl"
-                    ));
-                }
-                ConflictStrategy::Remote => {
-                    copy_session_bundle(remote, stage, &project, &session, &session)?;
-                    report.notes.push(format!(
-                        "remote session wins: projects/{project}/{session}.jsonl"
-                    ));
-                }
-                ConflictStrategy::Merge => {
-                    copy_session_bundle(local, stage, &project, &session, &session)?;
-                    let fork =
-                        merge_session_candidate(remote, stage, &project, &session, &session)?;
-                    report.notes.push(format!(
-                        "session forked: projects/{project}/{session}.jsonl -> {fork}.jsonl"
-                    ));
-                }
-            }
+            copy_session_bundle(local, stage, &project, &session, &session)?;
+            let fork = merge_session_candidate(remote, stage, &project, &session, &session)?;
+            report.notes.push(format!(
+                "session forked: projects/{project}/{session}.jsonl -> {fork}.jsonl"
+            ));
         }
         report
             .notes
@@ -635,6 +736,18 @@ fn build_stage_full(
             }
         }
     }
+    for ((project, target), choice) in choices {
+        if !matches!(choice, MemoryChoice::Edited { .. }) {
+            continue;
+        }
+        let entry = format!("projects/{project}/memory/{target}");
+        let index = format!("projects/{project}/memory/MEMORY.md");
+        for file in &mut report.files {
+            if file.path == entry || file.path == index {
+                file.resolution = "edited".into();
+            }
+        }
+    }
     // Preserve a local copy for interactive rebuild without reopening mutable source.
     let copy = stage.parent().unwrap().join("local-copy");
     if !conflicts.is_empty() && !copy.exists() {
@@ -661,16 +774,6 @@ fn file_prefix(shorter: &FileRecord, longer: &FileRecord) -> Result<bool> {
             return Ok(false);
         }
     }
-}
-
-fn main_session_identity(path: &Path) -> Option<(String, String)> {
-    let parts = path.iter().collect::<Vec<_>>();
-    if parts.len() != 3 || parts[0] != "projects" || path.extension()?.to_str()? != "jsonl" {
-        return None;
-    }
-    let session = path.file_stem()?.to_str()?.to_owned();
-    uuid::Uuid::parse_str(&session).ok()?;
-    Some((parts[1].to_string_lossy().into_owned(), session))
 }
 
 fn session_bundle_identity(path: &Path) -> Option<(String, String)> {
@@ -873,7 +976,7 @@ fn merge_memories(
     local: &Path,
     remote: &Path,
     stage: &Path,
-    choices: &BTreeMap<(String, String), Side>,
+    choices: &BTreeMap<(String, String), MemoryChoice>,
     strategy: ConflictStrategy,
     report: &mut PlanReport,
     conflicts: &mut Vec<MemoryConflict>,
@@ -906,68 +1009,101 @@ fn merge_memories(
             let right = ri.items.get(&target);
             let local_file = lf.get(&target);
             let remote_file = rf.get(&target);
+            if let Some(MemoryChoice::Edited { content, index }) =
+                choices.get(&(project.clone(), target.clone()))
+            {
+                let source = local_file
+                    .or(remote_file)
+                    .context("edited memory source disappeared")?;
+                let dest = stage
+                    .join("projects")
+                    .join(&project)
+                    .join("memory")
+                    .join(&target);
+                private_dir(dest.parent().context("memory destination parent")?)?;
+                fs::write(&dest, content)?;
+                let mtime = fs::metadata(source)?.modified()?;
+                selected.insert(target.clone(), (index.clone(), mtime));
+                report
+                    .notes
+                    .push(format!("memory edited: {project}/{target}"));
+                continue;
+            }
             let content_differs = match (local_file, remote_file) {
                 (Some(local), Some(remote)) => sha256(local)? != sha256(remote)?,
                 _ => false,
             };
             let index_differs = matches!((left, right), (Some(a), Some(b)) if a != b);
-            let mut merged_content = None;
-            let automatic_side = match strategy {
+            let explicit_choice = match choices.get(&(project.clone(), target.clone())) {
+                Some(MemoryChoice::Side(side)) => Some(*side),
+                _ => None,
+            };
+            let policy_side = explicit_choice.or(match strategy {
                 ConflictStrategy::Local => Some(Side::Local),
                 ConflictStrategy::Remote => Some(Side::Remote),
-                ConflictStrategy::Merge => match (local_file, remote_file) {
-                    (Some(local), Some(remote)) if content_differs => {
-                        let local_bytes = fs::read(local)?;
-                        let remote_bytes = fs::read(remote)?;
-                        if remote_bytes.starts_with(&local_bytes) {
-                            Some(Side::Remote)
-                        } else if local_bytes.starts_with(&remote_bytes) {
-                            Some(Side::Local)
-                        } else {
-                            merged_content = merge_markdown_sections(
-                                &fs::read_to_string(local)?,
-                                &fs::read_to_string(remote)?,
-                            );
-                            None
-                        }
+                ConflictStrategy::Ask => None,
+            });
+            let mut merged_content = None;
+            let mut content_side = None;
+            let mut used_policy_for_content = false;
+            if let (Some(local), Some(remote)) = (local_file, remote_file)
+                && content_differs
+            {
+                let local_bytes = fs::read(local)?;
+                let remote_bytes = fs::read(remote)?;
+                if remote_bytes.starts_with(&local_bytes) {
+                    content_side = Some(Side::Remote);
+                } else if local_bytes.starts_with(&remote_bytes) {
+                    content_side = Some(Side::Local);
+                } else {
+                    used_policy_for_content = policy_side.is_some();
+                    merged_content = merge_markdown_sections(
+                        &fs::read_to_string(local)?,
+                        &fs::read_to_string(remote)?,
+                        policy_side,
+                    );
+                    if merged_content.is_none() {
+                        content_side = policy_side;
                     }
-                    _ => None,
-                },
-            };
-            let explicit_choice = choices.get(&(project.clone(), target.clone())).copied();
-            if explicit_choice.is_some() {
-                merged_content = None;
+                }
             }
-            let mut side = explicit_choice.or(automatic_side);
+            let index_side = if index_differs {
+                content_side.or(policy_side)
+            } else {
+                content_side
+            };
+            let content_requires_choice =
+                content_differs && merged_content.is_none() && content_side.is_none();
+            let index_requires_choice = index_differs && index_side.is_none();
             let mut unresolved = false;
-            if local_file.is_some()
-                && remote_file.is_some()
-                && ((content_differs && merged_content.is_none()) || index_differs)
-                && side.is_none()
+            if let (Some(local_path), Some(remote_path)) = (local_file, remote_file)
+                && (content_requires_choice || index_requires_choice)
             {
                 let local_block = left.cloned().unwrap_or_default();
                 let remote_block = right.cloned().unwrap_or_default();
                 conflicts.push(MemoryConflict {
                     project: project.clone(),
                     target: target.clone(),
-                    local: local_block,
-                    remote: remote_block,
+                    local_content: fs::read_to_string(local_path)?,
+                    remote_content: fs::read_to_string(remote_path)?,
+                    local_index: local_block,
+                    remote_index: remote_block,
+                    content_requires_choice,
+                    index_requires_choice,
                 });
                 report.blockers.push(Blocker {
                     resource: "memory".into(),
                     path: format!("{project}/{target}"),
                     reason: "memory content or index requires a choice".into(),
                 });
-                side = Some(Side::Remote);
-                merged_content = None;
                 unresolved = true;
             }
-            let source = match side {
+            let source = match content_side {
                 Some(Side::Local) => local_file.or(remote_file),
                 Some(Side::Remote) | None => remote_file.or(local_file),
             }
             .context("memory source disappeared")?;
-            let block = match match side {
+            let block = match match index_side {
                 Some(Side::Local) => left.or(right),
                 Some(Side::Remote) | None => right.or(left),
             } {
@@ -976,15 +1112,16 @@ fn merge_memories(
             };
             if content_differs
                 && !unresolved
-                && let Some(selected_side) = side
+                && let Some(selected_side) = policy_side
+                && used_policy_for_content
             {
                 let label = match selected_side {
                     Side::Local => "local",
                     Side::Remote => "remote",
                 };
-                report
-                    .notes
-                    .push(format!("{label} memory wins: {project}/{target}"));
+                report.notes.push(format!(
+                    "{label} conflict blocks selected: {project}/{target}"
+                ));
             }
             let dest = stage
                 .join("projects")
@@ -1058,20 +1195,25 @@ fn markdown_sections(text: &str) -> Option<Vec<(String, String)>> {
     Some(sections)
 }
 
-fn merge_markdown_sections(local: &str, remote: &str) -> Option<String> {
+fn merge_markdown_sections(
+    local: &str,
+    remote: &str,
+    conflict_side: Option<Side>,
+) -> Option<String> {
     let local = markdown_sections(local)?;
     let remote = markdown_sections(remote)?;
     let remote_map = remote.iter().cloned().collect::<BTreeMap<_, _>>();
     let local_map = local.iter().cloned().collect::<BTreeMap<_, _>>();
-    for (key, local_body) in &local_map {
-        if let Some(remote_body) = remote_map.get(key)
-            && remote_body != local_body
-        {
-            return None;
-        }
-    }
     let mut output = String::new();
-    for (_, body) in &local {
+    for (key, local_body) in &local {
+        let body = match remote_map.get(key) {
+            Some(remote_body) if remote_body != local_body => match conflict_side {
+                Some(Side::Local) => local_body,
+                Some(Side::Remote) => remote_body,
+                None => return None,
+            },
+            _ => local_body,
+        };
         output.push_str(body);
     }
     for (key, body) in &remote {
@@ -1393,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_strategy_forks_divergent_sessions_and_rewrites_bundle() {
+    fn ask_strategy_forks_divergent_sessions_and_rewrites_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -1434,7 +1576,7 @@ mod tests {
             ResourceSelection::Sessions,
             &BTreeMap::new(),
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
         assert!(report.blockers.is_empty());
@@ -1468,6 +1610,36 @@ mod tests {
             .unwrap(),
             "remote tool result\n"
         );
+
+        for (name, strategy) in [
+            ("local-stage", ConflictStrategy::Local),
+            ("remote-stage", ConflictStrategy::Remote),
+        ] {
+            let policy_stage = temp.path().join(name);
+            let (report, _) = build_stage_full(
+                &local,
+                &remote,
+                &policy_stage,
+                ResourceSelection::Sessions,
+                &BTreeMap::new(),
+                "mini",
+                strategy,
+            )
+            .unwrap();
+            assert!(report.blockers.is_empty());
+            let main_count = fs::read_dir(policy_stage.join("projects").join(project))
+                .unwrap()
+                .filter_map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+                        .then_some(path)
+                })
+                .count();
+            assert_eq!(
+                main_count, 2,
+                "strategy {strategy} must preserve both forks"
+            );
+        }
     }
 
     #[test]
@@ -1504,7 +1676,7 @@ mod tests {
             ResourceSelection::Sessions,
             &BTreeMap::new(),
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
         let first_fork = fs::read_dir(first_stage.join("projects").join(project))
@@ -1535,7 +1707,7 @@ mod tests {
             ResourceSelection::Sessions,
             &BTreeMap::new(),
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
 
@@ -1588,7 +1760,103 @@ mod tests {
     }
 
     #[test]
-    fn merge_memory_strategy_blocks_ambiguous_content() {
+    fn local_memory_strategy_only_selects_conflicting_sections() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        write_memory(
+            &local,
+            "project",
+            "# Shared\n\nlocal choice\n# Local only\n\nlocal detail",
+            "local description",
+        );
+        write_memory(
+            &remote,
+            "project",
+            "# Shared\n\nremote choice\n# Remote only\n\nremote detail",
+            "remote description",
+        );
+
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Local,
+        )
+        .unwrap();
+
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        let content = fs::read_to_string(stage.join("projects/project/memory/facts.md")).unwrap();
+        assert!(content.contains("local choice"));
+        assert!(!content.contains("remote choice"));
+        assert!(content.contains("local detail"));
+        assert!(content.contains("remote detail"));
+    }
+
+    #[test]
+    fn edited_memory_choice_replaces_content_and_index_in_the_staged_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        write_memory(&local, "project", "local body", "local description");
+        write_memory(&remote, "project", "remote body", "remote description");
+        let choices = BTreeMap::from([(
+            ("project".to_owned(), "facts.md".to_owned()),
+            MemoryChoice::Edited {
+                content: "resolved body\n".into(),
+                index: "- [facts](facts.md) — resolved description\n".into(),
+            },
+        )]);
+
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &choices,
+            "mini",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        let memory = stage.join("projects/project/memory");
+        assert_eq!(
+            fs::read_to_string(memory.join("facts.md")).unwrap(),
+            "resolved body\n"
+        );
+        assert!(
+            fs::read_to_string(memory.join("MEMORY.md"))
+                .unwrap()
+                .contains("resolved description")
+        );
+        assert!(report.files.iter().any(|file| {
+            file.path.ends_with("/memory/facts.md") && file.resolution == "edited"
+        }));
+        assert!(report.files.iter().any(|file| {
+            file.path.ends_with("/memory/MEMORY.md") && file.resolution == "edited"
+        }));
+    }
+
+    #[test]
+    fn editor_conflict_markers_are_git_style_and_detectable() {
+        let text = conflict_markers("local\n", "remote\n", "mini");
+        assert!(text.starts_with("<<<<<<< LOCAL\n"));
+        assert!(text.contains("\n=======\n"));
+        assert!(text.ends_with(">>>>>>> REMOTE mini\n"));
+        assert!(has_conflict_markers(&text));
+        assert!(!has_conflict_markers("resolved\n"));
+    }
+
+    #[test]
+    fn ask_memory_strategy_blocks_ambiguous_content() {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -1603,7 +1871,7 @@ mod tests {
             ResourceSelection::Memory,
             &BTreeMap::new(),
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
         assert_eq!(report.blockers.len(), 1);
@@ -1645,7 +1913,7 @@ mod tests {
             ResourceSelection::Memory,
             &BTreeMap::new(),
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
         assert!(report.files.is_empty());
@@ -1654,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_memory_strategy_combines_independent_heading_blocks() {
+    fn ask_memory_strategy_combines_independent_heading_blocks() {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -1679,7 +1947,7 @@ mod tests {
             ResourceSelection::Memory,
             &BTreeMap::new(),
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
         assert!(report.blockers.is_empty());
@@ -1690,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_memory_choice_overrides_possible_block_merge() {
+    fn explicit_memory_choice_only_selects_conflicting_blocks() {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -1707,8 +1975,10 @@ mod tests {
             "# Remote facts\n\nremote detail",
             "remote description",
         );
-        let choices =
-            BTreeMap::from([(("project".to_owned(), "facts.md".to_owned()), Side::Local)]);
+        let choices = BTreeMap::from([(
+            ("project".to_owned(), "facts.md".to_owned()),
+            MemoryChoice::Side(Side::Local),
+        )]);
         let (report, conflicts) = build_stage_full(
             &local,
             &remote,
@@ -1716,7 +1986,7 @@ mod tests {
             ResourceSelection::Memory,
             &choices,
             "mini",
-            ConflictStrategy::Merge,
+            ConflictStrategy::Ask,
         )
         .unwrap();
         assert!(report.blockers.is_empty());
@@ -1724,7 +1994,7 @@ mod tests {
         let memory = stage.join("projects/project/memory");
         let content = fs::read_to_string(memory.join("facts.md")).unwrap();
         assert!(content.contains("local detail"));
-        assert!(!content.contains("remote detail"));
+        assert!(content.contains("remote detail"));
         assert!(
             fs::read_to_string(memory.join("MEMORY.md"))
                 .unwrap()

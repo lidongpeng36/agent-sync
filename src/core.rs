@@ -6,8 +6,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
 #[derive(Clone, Copy)]
@@ -31,7 +34,9 @@ pub enum ConflictStrategy {
     Local,
     Remote,
     #[default]
-    Merge,
+    #[serde(alias = "merge")]
+    #[value(alias = "merge")]
+    Ask,
 }
 
 impl fmt::Display for ConflictStrategy {
@@ -39,7 +44,7 @@ impl fmt::Display for ConflictStrategy {
         formatter.write_str(match self {
             Self::Local => "local",
             Self::Remote => "remote",
-            Self::Merge => "merge",
+            Self::Ask => "ask",
         })
     }
 }
@@ -94,6 +99,7 @@ impl fmt::Display for FileAction {
 pub struct FileChange {
     pub resource: String,
     pub path: String,
+    pub display_path: String,
     pub local: FileAction,
     pub remote: FileAction,
     pub resolution: String,
@@ -120,58 +126,203 @@ pub struct PlanReport {
 }
 
 impl PlanReport {
+    fn render_human(&self) -> String {
+        let mut output = String::new();
+        writeln!(
+            output,
+            "agent: {}; peer: {}; resources: {}",
+            self.agent,
+            self.peer,
+            self.resources.join(",")
+        )
+        .unwrap();
+        if let Some(strategy) = self.conflict_strategy {
+            writeln!(output, "conflict strategy: {strategy}").unwrap();
+        }
+        writeln!(
+            output,
+            "local additions: {}; remote additions: {}; advances: {}; identical: {}",
+            self.local_additions, self.remote_additions, self.advances, self.identical
+        )
+        .unwrap();
+        if self.metadata_repairs > 0 {
+            writeln!(output, "metadata repairs: {}", self.metadata_repairs).unwrap();
+        }
+        for note in &self.notes {
+            writeln!(output, "note: {note}").unwrap();
+        }
+        if !self.files.is_empty() {
+            let path_width = self
+                .files
+                .iter()
+                .map(|file| UnicodeWidthStr::width(file.display_path.as_str()))
+                .max()
+                .unwrap_or(24)
+                .clamp(24, 68);
+            writeln!(output, "files ({}):", self.files.len()).unwrap();
+            writeln!(
+                output,
+                "{}",
+                table_row("PATH", "LOCAL", "REMOTE", "RESULT", path_width)
+            )
+            .unwrap();
+            for file in &self.files {
+                writeln!(
+                    output,
+                    "{}",
+                    table_row(
+                        &file.display_path,
+                        action_symbol(file.local),
+                        action_symbol(file.remote),
+                        resolution_symbol(&file.resolution),
+                        path_width,
+                    )
+                )
+                .unwrap();
+            }
+            writeln!(
+                output,
+                "  side actions: = unchanged  + create  ↻ update content  ~ metadata only  − remove"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "  results: L use local  R use remote  M merged  E edited  = same  ✦ generated  ? choose"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "  ↻ means that --apply updates that side to the staged result; it does not mean merge."
+            )
+            .unwrap();
+        }
+        if self.blockers.is_empty() {
+            writeln!(output, "status: ready").unwrap();
+            return output;
+        }
+
+        writeln!(output, "action required ({}):", self.blockers.len()).unwrap();
+        for blocker in &self.blockers {
+            let display_path = self
+                .files
+                .iter()
+                .find(|file| {
+                    file.resource == blocker.resource
+                        && file.resolution == "unresolved"
+                        && blocker
+                            .path
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|target| file.path.ends_with(target))
+                })
+                .map(|file| file.display_path.as_str())
+                .unwrap_or(&blocker.path);
+            writeln!(output, "  ? {display_path}").unwrap();
+            writeln!(output, "    {}", blocker_explanation(blocker)).unwrap();
+        }
+        writeln!(output, "next steps:").unwrap();
+        writeln!(
+            output,
+            "  inspect full content diff: agent-sync sync {} {} -f diff",
+            self.agent, self.peer
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  resolve per conflict:      agent-sync sync {} {} -s ask --apply",
+            self.agent, self.peer
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "    choose l (local), r (remote), or e ($EDITOR), then confirm with [Y/n]"
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  use local for all:         agent-sync sync {} {} -s local --apply",
+            self.agent, self.peer
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  use remote for all:        agent-sync sync {} {} -s remote --apply",
+            self.agent, self.peer
+        )
+        .unwrap();
+        writeln!(output, "status: action required; no files changed").unwrap();
+        output
+    }
+
     pub fn print(&self, format: OutputFormat) -> Result<()> {
         match format {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(self)?),
             OutputFormat::Diff => {
                 bail!("diff output requires a prepared synchronization plan")
             }
-            OutputFormat::Human => {
-                println!(
-                    "agent: {}; peer: {}; resources: {}",
-                    self.agent,
-                    self.peer,
-                    self.resources.join(",")
-                );
-                if let Some(strategy) = self.conflict_strategy {
-                    println!("conflict strategy: {strategy}");
-                }
-                println!(
-                    "local additions: {}; remote additions: {}; advances: {}; identical: {}",
-                    self.local_additions, self.remote_additions, self.advances, self.identical
-                );
-                if self.metadata_repairs > 0 {
-                    println!("metadata repairs: {}", self.metadata_repairs);
-                }
-                for note in &self.notes {
-                    println!("note: {note}");
-                }
-                if !self.files.is_empty() {
-                    println!("files:");
-                    for file in &self.files {
-                        println!(
-                            "  [{}] {}: local={}, remote={}, result={}",
-                            file.resource, file.path, file.local, file.remote, file.resolution
-                        );
-                    }
-                }
-                for blocker in &self.blockers {
-                    println!(
-                        "BLOCKED [{}] {}: {}",
-                        blocker.resource, blocker.path, blocker.reason
-                    );
-                }
-                println!(
-                    "mode: {}",
-                    if self.blockers.is_empty() {
-                        "ready"
-                    } else {
-                        "blocked"
-                    }
-                );
-            }
+            OutputFormat::Human => print!("{}", self.render_human()),
         }
         Ok(())
+    }
+}
+
+fn action_symbol(action: FileAction) -> &'static str {
+    match action {
+        FileAction::Unchanged => "=",
+        FileAction::Create => "+",
+        FileAction::Replace => "↻",
+        FileAction::Remove => "−",
+        FileAction::Metadata => "~",
+    }
+}
+
+fn pad_right(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn center(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    let left = padding / 2;
+    format!(
+        "{}{}{}",
+        " ".repeat(left),
+        value,
+        " ".repeat(padding - left)
+    )
+}
+
+fn table_row(path: &str, local: &str, remote: &str, result: &str, path_width: usize) -> String {
+    format!(
+        "  {}  {}  {}  {}",
+        pad_right(path, path_width),
+        center(local, 5),
+        center(remote, 6),
+        center(result, 6),
+    )
+}
+
+fn resolution_symbol(resolution: &str) -> &'static str {
+    match resolution {
+        "local" => "L",
+        "remote" => "R",
+        "merged" => "M",
+        "edited" => "E",
+        "identical" => "=",
+        "generated" => "✦",
+        "removed" => "−",
+        "unresolved" => "?",
+        _ => "?",
+    }
+}
+
+fn blocker_explanation(blocker: &Blocker) -> &str {
+    if blocker.reason.contains("requires a choice") {
+        "Automatic merge could not safely combine the memory content or its index."
+    } else if blocker.reason.contains("active") {
+        "A session is still active; close its writer and run sync again."
+    } else {
+        &blocker.reason
     }
 }
 
@@ -230,15 +381,161 @@ fn resource_name(path: &str) -> &'static str {
     }
 }
 
+fn shorten_middle(value: &str, maximum: usize) -> String {
+    if UnicodeWidthStr::width(value) <= maximum {
+        return value.to_owned();
+    }
+    let ellipsis_width = UnicodeWidthChar::width('…').unwrap_or(1);
+    let available = maximum.saturating_sub(ellipsis_width);
+    let suffix_budget = available / 3;
+    let prefix_budget = available.saturating_sub(suffix_budget);
+    let mut prefix = String::new();
+    let mut prefix_width = 0;
+    for character in value.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if prefix_width + width > prefix_budget {
+            break;
+        }
+        prefix.push(character);
+        prefix_width += width;
+    }
+    let mut suffix = Vec::new();
+    let mut suffix_width = 0;
+    for character in value.chars().rev() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if suffix_width + width > suffix_budget {
+            break;
+        }
+        suffix.push(character);
+        suffix_width += width;
+    }
+    suffix.reverse();
+    format!("{prefix}…{}", suffix.into_iter().collect::<String>())
+}
+
+fn fallback_project_name(slug: &str) -> String {
+    slug.trim_matches('-')
+        .rsplit('-')
+        .find(|part| !part.is_empty())
+        .unwrap_or(slug)
+        .to_owned()
+}
+
+fn session_name(project: &str, session: &str, roots: [&Path; 3]) -> (String, String) {
+    let mut project_name = None;
+    let mut title = None;
+    for root in roots {
+        let transcript = root
+            .join("projects")
+            .join(project)
+            .join(format!("{session}.jsonl"));
+        let Ok(file) = File::open(transcript) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str)
+                && let Some(name) = Path::new(cwd).file_name().and_then(|name| name.to_str())
+            {
+                project_name = Some(name.to_owned());
+            }
+            if let Some(name) = value
+                .get("aiTitle")
+                .or_else(|| value.get("slug"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+            {
+                title = Some(name.to_owned());
+            }
+        }
+        if project_name.is_some() && title.is_some() {
+            break;
+        }
+    }
+    (
+        project_name.unwrap_or_else(|| fallback_project_name(project)),
+        title.unwrap_or_else(|| session.chars().take(8).collect()),
+    )
+}
+
+fn friendly_path(
+    path: &str,
+    roots: [&Path; 3],
+    sessions: &mut BTreeMap<(String, String), (String, String)>,
+) -> String {
+    let parts = Path::new(path)
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if parts.first().map(String::as_str) != Some("projects") || parts.len() < 3 {
+        return shorten_middle(path, 68);
+    }
+    let project = &parts[1];
+    if parts[2] == "memory" {
+        let target = parts
+            .get(3)
+            .map(|name| name.trim_end_matches(".md"))
+            .unwrap_or("memory");
+        let target = if target == "MEMORY" { "index" } else { target };
+        return shorten_middle(
+            &format!("{}/memory/{target}", fallback_project_name(project)),
+            68,
+        );
+    }
+    let session = parts[2].trim_end_matches(".jsonl");
+    if uuid::Uuid::parse_str(session).is_err() {
+        return shorten_middle(path, 68);
+    }
+    let (project_name, session_title) = sessions
+        .entry((project.clone(), session.to_owned()))
+        .or_insert_with(|| session_name(project, session, roots));
+    let mut display = format!(
+        "{}/{}",
+        shorten_middle(project_name, 20),
+        shorten_middle(session_title, 32)
+    );
+    if !parts[2].ends_with(".jsonl") {
+        match parts.get(3).map(String::as_str) {
+            Some("subagents") => {
+                let agent_file = parts.get(4);
+                let agent = agent_file
+                    .map(|name| {
+                        name.trim_start_matches("agent-")
+                            .split('.')
+                            .next()
+                            .unwrap_or(name)
+                    })
+                    .unwrap_or("unknown");
+                display.push_str(&format!("/subagent-{}", shorten_middle(agent, 10)));
+                if agent_file.is_some_and(|name| name.ends_with(".meta.json")) {
+                    display.push_str("/meta");
+                }
+            }
+            Some("tool-results") => {
+                let tool = parts.get(4).map(String::as_str).unwrap_or("result");
+                display.push_str(&format!("/tool-{}", shorten_middle(tool, 12)));
+            }
+            Some(other) => display.push_str(&format!("/{}", shorten_middle(other, 14))),
+            None => {}
+        }
+    }
+    shorten_middle(&display, 68)
+}
+
 pub fn planned_file_changes(
     local: &Path,
     remote: &Path,
     result: &Path,
     exclude: impl Fn(&Path) -> bool + Copy,
 ) -> Result<Vec<FileChange>> {
-    let local = planned_files(local, exclude)?;
-    let remote = planned_files(remote, exclude)?;
-    let result = planned_files(result, exclude)?;
+    let local_root = local;
+    let remote_root = remote;
+    let result_root = result;
+    let local = planned_files(local_root, exclude)?;
+    let remote = planned_files(remote_root, exclude)?;
+    let result = planned_files(result_root, exclude)?;
     let paths = local
         .keys()
         .chain(remote.keys())
@@ -246,6 +543,7 @@ pub fn planned_file_changes(
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     let mut changes = Vec::new();
+    let mut session_names = BTreeMap::new();
     for path in paths {
         let local_file = local.get(&path);
         let remote_file = remote.get(&path);
@@ -278,6 +576,11 @@ pub fn planned_file_changes(
         };
         changes.push(FileChange {
             resource: resource_name(&path).to_owned(),
+            display_path: friendly_path(
+                &path,
+                [result_root, local_root, remote_root],
+                &mut session_names,
+            ),
             path,
             local: local_action,
             remote: remote_action,
@@ -538,5 +841,104 @@ mod tests {
         assert!(diff.contains("+++ b/result/memories/remote.md"));
         assert!(diff.contains("+++ b/result/memories/merged.md"));
         assert!(diff.contains("+merged"));
+    }
+
+    #[test]
+    fn human_report_uses_symbols_and_actionable_conflict_guidance() {
+        let report = PlanReport {
+            agent: "claude".into(),
+            peer: "mini".into(),
+            resources: vec!["memory".into()],
+            conflict_strategy: Some(ConflictStrategy::Ask),
+            files: vec![FileChange {
+                resource: "memory".into(),
+                path: "projects/-Users-lidongpeng-udeer-udeer/memory/facts.md".into(),
+                display_path: "udeer/memory/facts".into(),
+                local: FileAction::Replace,
+                remote: FileAction::Unchanged,
+                resolution: "unresolved".into(),
+                local_sha256: Some("local".into()),
+                remote_sha256: Some("remote".into()),
+                result_sha256: Some("staged".into()),
+            }],
+            blockers: vec![Blocker {
+                resource: "memory".into(),
+                path: "-Users-lidongpeng-udeer-udeer/facts.md".into(),
+                reason: "memory content or index requires a choice".into(),
+            }],
+            ..PlanReport::default()
+        };
+
+        let rendered = report.render_human();
+        assert!(rendered.contains("PATH"));
+        assert!(rendered.contains("LOCAL  REMOTE  RESULT"));
+        assert!(rendered.contains("udeer/memory/facts"));
+        assert!(rendered.contains("↻ update content"));
+        assert!(rendered.contains("? choose"));
+        assert!(rendered.contains("action required (1):"));
+        assert!(rendered.contains("agent-sync sync claude mini -f diff"));
+        assert!(rendered.contains("-s local --apply"));
+        assert!(!rendered.contains("BLOCKED"));
+        assert!(!rendered.contains("result=unresolved"));
+    }
+
+    #[test]
+    fn table_columns_use_terminal_width_for_mixed_language_paths() {
+        let header = table_row("PATH", "LOCAL", "REMOTE", "RESULT", 36);
+        let ascii = table_row("udeer/release-v3", "=", "↻", "L", 36);
+        let chinese = table_row("项目/调查OpenCode配额错误", "↻", "=", "E", 36);
+
+        let expected_width = UnicodeWidthStr::width(header.as_str());
+        assert_eq!(UnicodeWidthStr::width(ascii.as_str()), expected_width);
+        assert_eq!(UnicodeWidthStr::width(chinese.as_str()), expected_width);
+        assert_eq!(UnicodeWidthStr::width(pad_right("中文", 12).as_str()), 12);
+        assert_eq!(UnicodeWidthStr::width(center("✦", 6).as_str()), 6);
+
+        let shortened = shorten_middle("项目目录/调查OpenCode配额错误和URL脱敏问题", 24);
+        assert!(shortened.contains('…'));
+        assert!(UnicodeWidthStr::width(shortened.as_str()) <= 24);
+    }
+
+    #[test]
+    fn claude_session_display_path_uses_project_and_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let result = temp.path().join("result");
+        let project = "-Users-lidongpeng-udeer-udeer";
+        let session = "95277219-228f-4257-bb4d-a676546cdd07";
+        for root in [&local, &remote, &result] {
+            fs::create_dir_all(root.join("projects").join(project)).unwrap();
+        }
+        fs::write(
+            result
+                .join("projects")
+                .join(project)
+                .join(format!("{session}.jsonl")),
+            r#"{"cwd":"/Users/lidongpeng/udeer/udeer","slug":"hidden-sprouting-crescent"}"#,
+        )
+        .unwrap();
+        let subagents = result
+            .join("projects")
+            .join(project)
+            .join(session)
+            .join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(subagents.join("agent-a62839bf499f.jsonl"), "{}\n").unwrap();
+        fs::write(subagents.join("agent-a62839bf499f.meta.json"), "{}\n").unwrap();
+
+        let changes = planned_file_changes(&local, &remote, &result, |_| false).unwrap();
+        assert_eq!(changes.len(), 3);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.display_path == "udeer/hidden-sprouting-crescent")
+        );
+        assert!(changes.iter().any(|change| {
+            change.display_path == "udeer/hidden-sprouting-crescent/subagent-a62839…99f"
+        }));
+        assert!(changes.iter().any(|change| {
+            change.display_path == "udeer/hidden-sprouting-crescent/subagent-a62839…99f/meta"
+        }));
     }
 }
