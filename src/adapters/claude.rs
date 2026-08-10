@@ -1,7 +1,8 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, PlanReport, ResourceSelection, SyncOptions, cache_path, copy_file_atomic, fingerprint,
-    manifest, private_dir, safe_relative, sha256, stamp,
+    Blocker, ConflictStrategy, PlanReport, ResourceSelection, SyncOptions, bytes_sha256,
+    cache_path, copy_file_atomic, fingerprint, manifest, planned_file_changes, print_planned_diff,
+    private_dir, safe_relative, sha256, stamp,
 };
 use crate::remote::{MtimeUpdate, Request as RemoteRequest, create_backup};
 use crate::transport::SshTransport;
@@ -40,6 +41,27 @@ pub struct ClaudePrepared {
     conflicts: Vec<MemoryConflict>,
     choices: BTreeMap<(String, String), Side>,
     resources: ResourceSelection,
+}
+
+pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> {
+    println!(
+        "# agent-sync: agent=claude peer={} mode={}",
+        prepared.report.peer,
+        if prepared.report.blockers.is_empty() {
+            "ready"
+        } else {
+            "blocked"
+        }
+    );
+    for blocker in &prepared.report.blockers {
+        println!(
+            "# BLOCKED [{}] {}: {}",
+            blocker.resource, blocker.path, blocker.reason
+        );
+    }
+    print_planned_diff(local, &prepared.remote_snapshot, &prepared.stage, |path| {
+        excluded(path, prepared.resources)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +108,7 @@ impl Adapter for ClaudeAdapter {
             options.resources,
             &BTreeMap::new(),
             &transport.host,
+            options.conflict_strategy,
         )?;
         let exclude = |p: &Path| excluded(p, options.resources);
         let remote_fingerprint = fingerprint(&remote, exclude)?;
@@ -152,6 +175,7 @@ impl Adapter for ClaudeAdapter {
             value.resources,
             &value.choices,
             &value.report.peer,
+            ConflictStrategy::Merge,
         )?;
         value.report = report;
         value.conflicts.clear();
@@ -224,7 +248,15 @@ fn pull_claude(
     resources: ResourceSelection,
 ) -> Result<()> {
     let filters = match resources {
-        ResourceSelection::All => vec!["--include=/projects/***", "--exclude=*"],
+        ResourceSelection::All => vec![
+            "--include=/projects/",
+            "--include=/projects/*/",
+            "--include=/projects/*/memory/",
+            "--include=/projects/*/memory/*.md",
+            "--exclude=/projects/*/memory/***",
+            "--include=/projects/***",
+            "--exclude=*",
+        ],
         ResourceSelection::Sessions => vec![
             "--exclude=/projects/*/memory/***",
             "--include=/projects/***",
@@ -278,6 +310,15 @@ fn excluded(path: &Path, resources: ResourceSelection) -> bool {
         return true;
     }
     let memory = parts.get(2).map(|v| v.as_ref()) == Some("memory");
+    let managed_memory = memory
+        && parts.len() == 4
+        && Path::new(parts[3].as_ref())
+            .extension()
+            .and_then(|value| value.to_str())
+            == Some("md");
+    if memory && !managed_memory {
+        return true;
+    }
     (memory && !resources.memory())
         || (!memory && !resources.sessions())
         || parts.iter().any(|v| v.as_ref().contains("sync-backups"))
@@ -412,8 +453,9 @@ fn build_stage(
     resources: ResourceSelection,
     choices: &BTreeMap<(String, String), Side>,
     peer: &str,
+    strategy: ConflictStrategy,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
-    build_stage_full(local, remote, stage, resources, choices, peer)
+    build_stage_full(local, remote, stage, resources, choices, peer, strategy)
 }
 
 fn build_stage_from_choices(
@@ -422,10 +464,11 @@ fn build_stage_from_choices(
     resources: ResourceSelection,
     choices: &BTreeMap<(String, String), Side>,
     peer: &str,
+    strategy: ConflictStrategy,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
     // The original local tree is retained next to the remote snapshot by prepare.
     let local = stage.parent().context("stage parent")?.join("local-copy");
-    build_stage_full(&local, remote, stage, resources, choices, peer)
+    build_stage_full(&local, remote, stage, resources, choices, peer, strategy)
 }
 
 fn build_stage_full(
@@ -435,11 +478,13 @@ fn build_stage_full(
     resources: ResourceSelection,
     choices: &BTreeMap<(String, String), Side>,
     peer: &str,
+    strategy: ConflictStrategy,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
     let mut report = PlanReport {
         agent: "claude".into(),
         peer: peer.into(),
         resources: Vec::new(),
+        conflict_strategy: Some(strategy),
         ..Default::default()
     };
     let mut conflicts = Vec::new();
@@ -447,6 +492,21 @@ fn build_stage_full(
         report.resources.push("sessions".into());
         let left = session_files(local)?;
         let right = session_files(remote)?;
+        let mut divergent_sessions = BTreeSet::new();
+        for (path, local_file) in &left {
+            let Some((project, session)) = main_session_identity(path) else {
+                continue;
+            };
+            let Some(remote_file) = right.get(path) else {
+                continue;
+            };
+            if local_file.sha != remote_file.sha
+                && !file_prefix(local_file, remote_file)?
+                && !file_prefix(remote_file, local_file)?
+            {
+                divergent_sessions.insert((project, session));
+            }
+        }
         let local_repairs = left
             .values()
             .filter(|file| file.event_ns.is_some() && file.event_ns != Some(file.mtime_ns))
@@ -461,6 +521,11 @@ fn build_stage_full(
         ));
         let mut metadata_only = 0;
         for path in left.keys().chain(right.keys()).collect::<BTreeSet<_>>() {
+            if session_bundle_identity(path)
+                .is_some_and(|identity| divergent_sessions.contains(&identity))
+            {
+                continue;
+            }
             let a = left.get(path);
             let b = right.get(path);
             let selected = match (a, b) {
@@ -513,13 +578,62 @@ fn build_stage_full(
                 )?;
             }
         }
+        for (project, session) in divergent_sessions {
+            match strategy {
+                ConflictStrategy::Local => {
+                    copy_session_bundle(local, stage, &project, &session, &session)?;
+                    report.notes.push(format!(
+                        "local session wins: projects/{project}/{session}.jsonl"
+                    ));
+                }
+                ConflictStrategy::Remote => {
+                    copy_session_bundle(remote, stage, &project, &session, &session)?;
+                    report.notes.push(format!(
+                        "remote session wins: projects/{project}/{session}.jsonl"
+                    ));
+                }
+                ConflictStrategy::Merge => {
+                    copy_session_bundle(local, stage, &project, &session, &session)?;
+                    let fork =
+                        merge_session_candidate(remote, stage, &project, &session, &session)?;
+                    report.notes.push(format!(
+                        "session forked: projects/{project}/{session}.jsonl -> {fork}.jsonl"
+                    ));
+                }
+            }
+        }
         report
             .notes
             .push(format!("metadata-only differences: {metadata_only}"));
     }
     if resources.memory() {
         report.resources.push("memory".into());
-        merge_memories(local, remote, stage, choices, &mut report, &mut conflicts)?;
+        merge_memories(
+            local,
+            remote,
+            stage,
+            choices,
+            strategy,
+            &mut report,
+            &mut conflicts,
+        )?;
+    }
+    report.files = planned_file_changes(local, remote, stage, |path| excluded(path, resources))?;
+    for blocker in report
+        .blockers
+        .iter()
+        .filter(|blocker| blocker.resource == "memory")
+    {
+        let Some((project, target)) = blocker.path.rsplit_once('/') else {
+            continue;
+        };
+        let entry = format!("projects/{project}/memory/{target}");
+        let index = format!("projects/{project}/memory/MEMORY.md");
+        for file in &mut report.files {
+            if file.path == entry || file.path == index {
+                file.resolution = "unresolved".into();
+            }
+        }
     }
     // Preserve a local copy for interactive rebuild without reopening mutable source.
     let copy = stage.parent().unwrap().join("local-copy");
@@ -549,6 +663,204 @@ fn file_prefix(shorter: &FileRecord, longer: &FileRecord) -> Result<bool> {
     }
 }
 
+fn main_session_identity(path: &Path) -> Option<(String, String)> {
+    let parts = path.iter().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "projects" || path.extension()?.to_str()? != "jsonl" {
+        return None;
+    }
+    let session = path.file_stem()?.to_str()?.to_owned();
+    uuid::Uuid::parse_str(&session).ok()?;
+    Some((parts[1].to_string_lossy().into_owned(), session))
+}
+
+fn session_bundle_identity(path: &Path) -> Option<(String, String)> {
+    let parts = path.iter().collect::<Vec<_>>();
+    if parts.len() < 3 || parts[0] != "projects" {
+        return None;
+    }
+    let third = parts[2].to_string_lossy();
+    let session = third.strip_suffix(".jsonl").unwrap_or(&third);
+    uuid::Uuid::parse_str(session).ok()?;
+    Some((parts[1].to_string_lossy().into_owned(), session.to_owned()))
+}
+
+fn copy_session_bundle(
+    source: &Path,
+    stage: &Path,
+    project: &str,
+    source_id: &str,
+    target_id: &str,
+) -> Result<()> {
+    let source_project = source.join("projects").join(project);
+    let target_project = stage.join("projects").join(project);
+    let source_main = source_project.join(format!("{source_id}.jsonl"));
+    if !source_main.exists() {
+        bail!(
+            "missing Claude session transcript: {}",
+            source_main.display()
+        );
+    }
+    copy_session_member(
+        &source_main,
+        &target_project.join(format!("{target_id}.jsonl")),
+        stage,
+        source_id,
+        target_id,
+    )?;
+
+    let source_sidecars = source_project.join(source_id);
+    if source_sidecars.exists() {
+        for entry in WalkDir::new(&source_sidecars)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(&source_sidecars)?;
+            copy_session_member(
+                entry.path(),
+                &target_project.join(target_id).join(relative),
+                stage,
+                source_id,
+                target_id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_session_member(
+    source: &Path,
+    destination: &Path,
+    stage: &Path,
+    source_id: &str,
+    target_id: &str,
+) -> Result<()> {
+    private_dir(destination.parent().context("session member parent")?)?;
+    if source.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        fs::copy(source, destination)?;
+        return Ok(());
+    }
+    if source_id == target_id {
+        fs::copy(source, destination)?;
+        let relative = destination.strip_prefix(stage)?;
+        let event_ns = validate_claude_jsonl(destination, relative)?;
+        filetime::set_file_mtime(
+            destination,
+            FileTime::from_unix_time(event_ns / 1_000_000_000, (event_ns % 1_000_000_000) as u32),
+        )?;
+        return Ok(());
+    }
+    let mut output = String::new();
+    for (number, line) in fs::read_to_string(source)?.lines().enumerate() {
+        if line.trim().is_empty() {
+            bail!("{}:{} blank JSONL record", source.display(), number + 1);
+        }
+        let mut value: Value = serde_json::from_str(line)?;
+        let object = value
+            .as_object_mut()
+            .context("Claude JSONL record is not an object")?;
+        for key in ["sessionId", "session_id"] {
+            if object.get(key).and_then(Value::as_str) == Some(source_id) {
+                object.insert(key.to_owned(), Value::String(target_id.to_owned()));
+            }
+        }
+        output.push_str(&serde_json::to_string(&value)?);
+        output.push('\n');
+    }
+    fs::write(destination, output)?;
+    let relative = destination.strip_prefix(stage)?;
+    let event_ns = validate_claude_jsonl(destination, relative)?;
+    filetime::set_file_mtime(
+        destination,
+        FileTime::from_unix_time(event_ns / 1_000_000_000, (event_ns % 1_000_000_000) as u32),
+    )?;
+    Ok(())
+}
+
+fn session_record(path: &Path, relative: &Path) -> Result<FileRecord> {
+    let metadata = fs::metadata(path)?;
+    Ok(FileRecord {
+        sha: sha256(path)?,
+        path: path.to_owned(),
+        size: metadata.len(),
+        mtime_ns: metadata.modified()?.duration_since(UNIX_EPOCH)?.as_nanos() as i64,
+        event_ns: Some(validate_claude_jsonl(path, relative)?),
+    })
+}
+
+fn remove_session_bundle(stage: &Path, project: &str, session: &str) -> Result<()> {
+    let project = stage.join("projects").join(project);
+    let main = project.join(format!("{session}.jsonl"));
+    if main.exists() {
+        fs::remove_file(main)?;
+    }
+    let sidecars = project.join(session);
+    if sidecars.exists() {
+        fs::remove_dir_all(sidecars)?;
+    }
+    Ok(())
+}
+
+fn fork_session_id(parent: &str, canonical: &Path, candidate: &Path) -> Result<String> {
+    let canonical_lines = fs::read_to_string(canonical)?;
+    let candidate_lines = fs::read_to_string(candidate)?;
+    let candidate_line = canonical_lines
+        .lines()
+        .zip(candidate_lines.lines())
+        .find_map(|(left, right)| (left != right).then_some(right))
+        .or_else(|| candidate_lines.lines().nth(canonical_lines.lines().count()))
+        .context("divergent Claude session has no candidate event")?;
+    let value: Value = serde_json::from_str(candidate_line)?;
+    let discriminator = value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| bytes_sha256(candidate_line.as_bytes()));
+    let namespace = uuid::Uuid::parse_str(parent)?;
+    Ok(uuid::Uuid::new_v5(&namespace, discriminator.as_bytes()).to_string())
+}
+
+fn merge_session_candidate(
+    source: &Path,
+    stage: &Path,
+    project: &str,
+    source_id: &str,
+    target_id: &str,
+) -> Result<String> {
+    let candidate_root = tempfile::tempdir()?;
+    copy_session_bundle(source, candidate_root.path(), project, source_id, target_id)?;
+    let candidate_main = candidate_root
+        .path()
+        .join("projects")
+        .join(project)
+        .join(format!("{target_id}.jsonl"));
+    let stage_relative = PathBuf::from("projects")
+        .join(project)
+        .join(format!("{target_id}.jsonl"));
+    let stage_main = stage.join(&stage_relative);
+    if !stage_main.exists() {
+        copy_session_bundle(candidate_root.path(), stage, project, target_id, target_id)?;
+        return Ok(target_id.to_owned());
+    }
+
+    let current = session_record(&stage_main, &stage_relative)?;
+    let candidate = session_record(&candidate_main, &stage_relative)?;
+    if current.sha == candidate.sha || file_prefix(&candidate, &current)? {
+        return Ok(target_id.to_owned());
+    }
+    if file_prefix(&current, &candidate)? {
+        remove_session_bundle(stage, project, target_id)?;
+        copy_session_bundle(candidate_root.path(), stage, project, target_id, target_id)?;
+        return Ok(target_id.to_owned());
+    }
+
+    let child_id = fork_session_id(target_id, &stage_main, &candidate_main)?;
+    merge_session_candidate(candidate_root.path(), stage, project, target_id, &child_id)
+}
+
 fn copy_tree_selected(source: &Path, dest: &Path, resources: ResourceSelection) -> Result<()> {
     for (path, _) in manifest(source, |p| excluded(p, resources))? {
         let rel = PathBuf::from(path);
@@ -562,6 +874,7 @@ fn merge_memories(
     remote: &Path,
     stage: &Path,
     choices: &BTreeMap<(String, String), Side>,
+    strategy: ConflictStrategy,
     report: &mut PlanReport,
     conflicts: &mut Vec<MemoryConflict>,
 ) -> Result<()> {
@@ -574,57 +887,119 @@ fn merge_memories(
         let rm = remote.join("projects").join(&project).join("memory");
         let lf = memory_files(&lm)?;
         let rf = memory_files(&rm)?;
+        let local_index_exists = lm.join("MEMORY.md").exists();
+        let remote_index_exists = rm.join("MEMORY.md").exists();
+        if lf.is_empty() && rf.is_empty() && !local_index_exists && !remote_index_exists {
+            continue;
+        }
         let li = memory_index(&lm, &lf)?;
         let ri = memory_index(&rm, &rf)?;
         let mut selected = BTreeMap::new();
         for target in lf.keys().chain(rf.keys()).cloned().collect::<BTreeSet<_>>() {
-            let source = rf.get(&target).or_else(|| lf.get(&target)).unwrap();
             if lf.contains_key(&target) && !rf.contains_key(&target) {
                 report.remote_additions += 1;
             }
             if rf.contains_key(&target) && !lf.contains_key(&target) {
                 report.local_additions += 1;
             }
-            if let (Some(local_file), Some(remote_file)) = (lf.get(&target), rf.get(&target)) {
-                if sha256(local_file)? != sha256(remote_file)? {
-                    report
-                        .notes
-                        .push(format!("remote content wins: {project}/{target}"));
-                }
-            }
             let left = li.items.get(&target);
             let right = ri.items.get(&target);
-            let block = match (left, right) {
-                (Some(a), Some(b)) if a != b => {
-                    match choices.get(&(project.clone(), target.clone())) {
-                        Some(Side::Local) => a.clone(),
-                        Some(Side::Remote) => b.clone(),
-                        None => {
-                            conflicts.push(MemoryConflict {
-                                project: project.clone(),
-                                target: target.clone(),
-                                local: a.clone(),
-                                remote: b.clone(),
-                            });
-                            report.blockers.push(Blocker {
-                                resource: "memory".into(),
-                                path: format!("{project}/{target}"),
-                                reason: "index description requires a choice".into(),
-                            });
-                            b.clone()
+            let local_file = lf.get(&target);
+            let remote_file = rf.get(&target);
+            let content_differs = match (local_file, remote_file) {
+                (Some(local), Some(remote)) => sha256(local)? != sha256(remote)?,
+                _ => false,
+            };
+            let index_differs = matches!((left, right), (Some(a), Some(b)) if a != b);
+            let mut merged_content = None;
+            let automatic_side = match strategy {
+                ConflictStrategy::Local => Some(Side::Local),
+                ConflictStrategy::Remote => Some(Side::Remote),
+                ConflictStrategy::Merge => match (local_file, remote_file) {
+                    (Some(local), Some(remote)) if content_differs => {
+                        let local_bytes = fs::read(local)?;
+                        let remote_bytes = fs::read(remote)?;
+                        if remote_bytes.starts_with(&local_bytes) {
+                            Some(Side::Remote)
+                        } else if local_bytes.starts_with(&remote_bytes) {
+                            Some(Side::Local)
+                        } else {
+                            merged_content = merge_markdown_sections(
+                                &fs::read_to_string(local)?,
+                                &fs::read_to_string(remote)?,
+                            );
+                            None
                         }
                     }
-                }
-                (Some(a), _) => a.clone(),
-                (_, Some(b)) => b.clone(),
-                _ => synthesize_block(source, &target)?,
+                    _ => None,
+                },
             };
+            let explicit_choice = choices.get(&(project.clone(), target.clone())).copied();
+            if explicit_choice.is_some() {
+                merged_content = None;
+            }
+            let mut side = explicit_choice.or(automatic_side);
+            let mut unresolved = false;
+            if local_file.is_some()
+                && remote_file.is_some()
+                && ((content_differs && merged_content.is_none()) || index_differs)
+                && side.is_none()
+            {
+                let local_block = left.cloned().unwrap_or_default();
+                let remote_block = right.cloned().unwrap_or_default();
+                conflicts.push(MemoryConflict {
+                    project: project.clone(),
+                    target: target.clone(),
+                    local: local_block,
+                    remote: remote_block,
+                });
+                report.blockers.push(Blocker {
+                    resource: "memory".into(),
+                    path: format!("{project}/{target}"),
+                    reason: "memory content or index requires a choice".into(),
+                });
+                side = Some(Side::Remote);
+                merged_content = None;
+                unresolved = true;
+            }
+            let source = match side {
+                Some(Side::Local) => local_file.or(remote_file),
+                Some(Side::Remote) | None => remote_file.or(local_file),
+            }
+            .context("memory source disappeared")?;
+            let block = match match side {
+                Some(Side::Local) => left.or(right),
+                Some(Side::Remote) | None => right.or(left),
+            } {
+                Some(block) => block.clone(),
+                None => synthesize_block(source, &target)?,
+            };
+            if content_differs
+                && !unresolved
+                && let Some(selected_side) = side
+            {
+                let label = match selected_side {
+                    Side::Local => "local",
+                    Side::Remote => "remote",
+                };
+                report
+                    .notes
+                    .push(format!("{label} memory wins: {project}/{target}"));
+            }
             let dest = stage
                 .join("projects")
                 .join(&project)
                 .join("memory")
                 .join(&target);
-            copy_file_atomic(source, &dest)?;
+            if let Some(content) = merged_content {
+                private_dir(dest.parent().context("memory destination parent")?)?;
+                fs::write(&dest, content)?;
+                report
+                    .notes
+                    .push(format!("memory blocks merged: {project}/{target}"));
+            } else {
+                copy_file_atomic(source, &dest)?;
+            }
             let mtime = fs::metadata(source)?.modified()?;
             selected.insert(target, (block, mtime));
         }
@@ -651,6 +1026,60 @@ fn merge_memories(
         fs::write(path, index)?;
     }
     Ok(())
+}
+
+fn markdown_sections(text: &str) -> Option<Vec<(String, String)>> {
+    let mut sections = Vec::new();
+    let mut key = String::new();
+    let mut body = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let hashes = trimmed.chars().take_while(|value| *value == '#').count();
+        let heading = (1..=6).contains(&hashes)
+            && trimmed
+                .chars()
+                .nth(hashes)
+                .is_some_and(|value| value == ' ');
+        if heading {
+            if sections.iter().any(|(existing, _)| existing == &key) {
+                return None;
+            }
+            sections.push((key, body));
+            key = trimmed.to_owned();
+            body = String::new();
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if sections.iter().any(|(existing, _)| existing == &key) {
+        return None;
+    }
+    sections.push((key, body));
+    Some(sections)
+}
+
+fn merge_markdown_sections(local: &str, remote: &str) -> Option<String> {
+    let local = markdown_sections(local)?;
+    let remote = markdown_sections(remote)?;
+    let remote_map = remote.iter().cloned().collect::<BTreeMap<_, _>>();
+    let local_map = local.iter().cloned().collect::<BTreeMap<_, _>>();
+    for (key, local_body) in &local_map {
+        if let Some(remote_body) = remote_map.get(key)
+            && remote_body != local_body
+        {
+            return None;
+        }
+    }
+    let mut output = String::new();
+    for (_, body) in &local {
+        output.push_str(body);
+    }
+    for (key, body) in &remote {
+        if !local_map.contains_key(key) {
+            output.push_str(body);
+        }
+    }
+    Some(output)
 }
 
 fn project_names(root: &Path) -> Result<BTreeSet<String>> {
@@ -903,6 +1332,41 @@ fn verify_selected(stage: &Path, actual: &Path, r: ResourceSelection, side: &str
 mod tests {
     use super::*;
 
+    fn write_session(root: &Path, project: &str, session: &str, events: &[(&str, &str)]) {
+        let project = root.join("projects").join(project);
+        fs::create_dir_all(&project).unwrap();
+        let mut text = String::new();
+        for (uuid, marker) in events {
+            text.push_str(
+                &serde_json::to_string(&serde_json::json!({
+                    "type": "user",
+                    "uuid": uuid,
+                    "sessionId": session,
+                    "timestamp": "2026-08-11T00:00:00Z",
+                    "marker": marker,
+                }))
+                .unwrap(),
+            );
+            text.push('\n');
+        }
+        fs::write(project.join(format!("{session}.jsonl")), text).unwrap();
+    }
+
+    fn write_memory(root: &Path, project: &str, body: &str, description: &str) {
+        let memory = root.join("projects").join(project).join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(
+            memory.join("facts.md"),
+            format!("---\nname: facts\ndescription: {description}\n---\n\n{body}\n"),
+        )
+        .unwrap();
+        fs::write(
+            memory.join("MEMORY.md"),
+            format!("# Memory\n\n- [facts](facts.md) — {description}\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn streams_strict_prefix() {
         let temp = tempfile::tempdir().unwrap();
@@ -926,6 +1390,346 @@ mod tests {
         };
         assert!(file_prefix(&a, &b).unwrap());
         assert!(!file_prefix(&b, &a).unwrap());
+    }
+
+    #[test]
+    fn merge_strategy_forks_divergent_sessions_and_rewrites_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        let project = "project";
+        let session = "11111111-1111-4111-8111-111111111111";
+        let common = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        write_session(
+            &local,
+            project,
+            session,
+            &[
+                (common, "common"),
+                ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "local"),
+            ],
+        );
+        write_session(
+            &remote,
+            project,
+            session,
+            &[
+                (common, "common"),
+                ("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "remote"),
+            ],
+        );
+        let remote_tool = remote
+            .join("projects")
+            .join(project)
+            .join(session)
+            .join("tool-results/result.txt");
+        fs::create_dir_all(remote_tool.parent().unwrap()).unwrap();
+        fs::write(&remote_tool, "remote tool result\n").unwrap();
+
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Sessions,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+
+        let project_stage = stage.join("projects").join(project);
+        let main_files = fs::read_dir(&project_stage)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|value| value.to_str()) == Some("jsonl")).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(main_files.len(), 2);
+        let fork = main_files
+            .iter()
+            .find(|path| path.file_stem().unwrap() != session)
+            .unwrap();
+        let fork_id = fork.file_stem().unwrap().to_string_lossy();
+        let fork_text = fs::read_to_string(fork).unwrap();
+        assert!(fork_text.contains("\"marker\":\"remote\""));
+        assert!(fork_text.lines().all(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["sessionId"] == fork_id.as_ref()
+        }));
+        assert_eq!(
+            fs::read_to_string(
+                project_stage
+                    .join(fork_id.as_ref())
+                    .join("tool-results/result.txt")
+            )
+            .unwrap(),
+            "remote tool result\n"
+        );
+    }
+
+    #[test]
+    fn existing_fork_is_advanced_instead_of_duplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let first_stage = temp.path().join("first-stage");
+        let second_remote = temp.path().join("second-remote");
+        let second_stage = temp.path().join("second-stage");
+        let project = "project";
+        let session = "11111111-1111-4111-8111-111111111111";
+        let common = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let remote_event = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        write_session(
+            &local,
+            project,
+            session,
+            &[
+                (common, "common"),
+                ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "local"),
+            ],
+        );
+        write_session(
+            &remote,
+            project,
+            session,
+            &[(common, "common"), (remote_event, "remote")],
+        );
+        build_stage_full(
+            &local,
+            &remote,
+            &first_stage,
+            ResourceSelection::Sessions,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+        let first_fork = fs::read_dir(first_stage.join("projects").join(project))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+                    && path.file_stem().unwrap() != session)
+                    .then_some(path.file_stem().unwrap().to_string_lossy().into_owned())
+            })
+            .next()
+            .unwrap();
+
+        write_session(
+            &second_remote,
+            project,
+            session,
+            &[
+                (common, "common"),
+                (remote_event, "remote"),
+                ("dddddddd-dddd-4ddd-8ddd-dddddddddddd", "extended"),
+            ],
+        );
+        build_stage_full(
+            &first_stage,
+            &second_remote,
+            &second_stage,
+            ResourceSelection::Sessions,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+
+        let project_stage = second_stage.join("projects").join(project);
+        let main_files = fs::read_dir(&project_stage)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|value| value.to_str()) == Some("jsonl")).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(main_files.len(), 2);
+        let advanced =
+            fs::read_to_string(project_stage.join(format!("{first_fork}.jsonl"))).unwrap();
+        assert!(advanced.contains("\"marker\":\"extended\""));
+    }
+
+    #[test]
+    fn local_memory_strategy_selects_content_and_index_as_a_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        write_memory(&local, "project", "local body", "local description");
+        write_memory(&remote, "project", "remote body", "remote description");
+
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Local,
+        )
+        .unwrap();
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        let memory = stage.join("projects/project/memory");
+        assert!(
+            fs::read_to_string(memory.join("facts.md"))
+                .unwrap()
+                .contains("local body")
+        );
+        assert!(
+            fs::read_to_string(memory.join("MEMORY.md"))
+                .unwrap()
+                .contains("local description")
+        );
+    }
+
+    #[test]
+    fn merge_memory_strategy_blocks_ambiguous_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        write_memory(&local, "project", "disk is full", "local description");
+        write_memory(&remote, "project", "disk is roomy", "remote description");
+
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(conflicts.len(), 1);
+        assert!(!report.notes.iter().any(|note| note.contains("memory wins")));
+        assert!(report.files.iter().any(|file| {
+            file.path.ends_with("/memory/facts.md") && file.resolution == "unresolved"
+        }));
+        assert!(report.files.iter().any(|file| {
+            file.path.ends_with("/memory/MEMORY.md") && file.resolution == "unresolved"
+        }));
+    }
+
+    #[test]
+    fn unmanaged_memory_files_are_excluded_and_empty_projects_are_not_generated() {
+        assert!(excluded(
+            Path::new("projects/project/memory/backup.bak"),
+            ResourceSelection::All
+        ));
+        assert!(excluded(
+            Path::new("projects/project/memory/nested/facts.md"),
+            ResourceSelection::All
+        ));
+        assert!(!excluded(
+            Path::new("projects/project/memory/facts.md"),
+            ResourceSelection::All
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        fs::create_dir_all(local.join("projects/project")).unwrap();
+        fs::create_dir_all(remote.join("projects/project")).unwrap();
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+        assert!(report.files.is_empty());
+        assert!(conflicts.is_empty());
+        assert!(!stage.join("projects/project/memory/MEMORY.md").exists());
+    }
+
+    #[test]
+    fn merge_memory_strategy_combines_independent_heading_blocks() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        write_memory(
+            &local,
+            "project",
+            "# Local facts\n\nlocal detail",
+            "shared description",
+        );
+        write_memory(
+            &remote,
+            "project",
+            "# Remote facts\n\nremote detail",
+            "shared description",
+        );
+
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeMap::new(),
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        let merged = fs::read_to_string(stage.join("projects/project/memory/facts.md")).unwrap();
+        assert!(merged.contains("local detail"));
+        assert!(merged.contains("remote detail"));
+    }
+
+    #[test]
+    fn explicit_memory_choice_overrides_possible_block_merge() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        write_memory(
+            &local,
+            "project",
+            "# Local facts\n\nlocal detail",
+            "local description",
+        );
+        write_memory(
+            &remote,
+            "project",
+            "# Remote facts\n\nremote detail",
+            "remote description",
+        );
+        let choices =
+            BTreeMap::from([(("project".to_owned(), "facts.md".to_owned()), Side::Local)]);
+        let (report, conflicts) = build_stage_full(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &choices,
+            "mini",
+            ConflictStrategy::Merge,
+        )
+        .unwrap();
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        let memory = stage.join("projects/project/memory");
+        let content = fs::read_to_string(memory.join("facts.md")).unwrap();
+        assert!(content.contains("local detail"));
+        assert!(!content.contains("remote detail"));
+        assert!(
+            fs::read_to_string(memory.join("MEMORY.md"))
+                .unwrap()
+                .contains("local description")
+        );
     }
 
     #[test]

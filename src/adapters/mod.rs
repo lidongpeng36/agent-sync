@@ -38,8 +38,12 @@ impl Prepared {
             Self::Codex(v) => &v.report,
         }
     }
-    pub fn print(&self, output: OutputFormat) -> Result<()> {
-        self.report().print(output)
+    pub fn print(&self, output: OutputFormat, local_root: &Path) -> Result<()> {
+        match (self, output) {
+            (Self::Claude(value), OutputFormat::Diff) => claude::print_diff(value, local_root),
+            (Self::Codex(value), OutputFormat::Diff) => codex::print_diff(value, local_root),
+            _ => self.report().print(output),
+        }
     }
     pub fn blocked(&self) -> bool {
         !self.report().blockers.is_empty()

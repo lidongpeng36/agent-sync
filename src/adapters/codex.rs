@@ -1,7 +1,7 @@
 use super::{Adapter, Prepared};
 use crate::core::{
     Blocker, PlanReport, ResourceSelection, SyncOptions, bytes_sha256, cache_path, fingerprint,
-    manifest, private_dir, stamp,
+    manifest, planned_file_changes, print_planned_diff, private_dir, stamp,
 };
 use crate::remote::{Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
@@ -38,11 +38,33 @@ pub struct CodexPrepared {
     pub report: PlanReport,
     temp: TempDir,
     stage: PathBuf,
+    remote_snapshot: PathBuf,
     local_fingerprint: String,
     remote_fingerprint: String,
     resources: ResourceSelection,
     metadata: BTreeMap<String, Times>,
     active: BTreeSet<String>,
+}
+
+pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
+    println!(
+        "# agent-sync: agent=codex peer={} mode={}",
+        prepared.report.peer,
+        if prepared.report.blockers.is_empty() {
+            "ready"
+        } else {
+            "blocked"
+        }
+    );
+    for blocker in &prepared.report.blockers {
+        println!(
+            "# BLOCKED [{}] {}: {}",
+            blocker.resource, blocker.path, blocker.reason
+        );
+    }
+    print_planned_diff(local, &prepared.remote_snapshot, &prepared.stage, |path| {
+        excluded(path, prepared.resources)
+    })
 }
 
 impl Adapter for CodexAdapter {
@@ -85,6 +107,9 @@ impl Adapter for CodexAdapter {
             &active,
             &transport.host,
         )?;
+        report.files = planned_file_changes(local, &remote, &stage, |path| {
+            excluded(path, options.resources)
+        })?;
         if options.apply && options.resources.sessions() && !active.is_empty() {
             report.blockers.push(Blocker {
                 resource: "sessions".into(),
@@ -98,6 +123,7 @@ impl Adapter for CodexAdapter {
             report,
             temp,
             stage,
+            remote_snapshot: remote,
             local_fingerprint: fingerprint(local, exclude)?,
             remote_fingerprint,
             resources: options.resources,
