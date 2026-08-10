@@ -3,7 +3,8 @@ use crate::core::{
     Blocker, PlanReport, ResourceSelection, SyncOptions, bytes_sha256, cache_path, fingerprint,
     manifest, private_dir, stamp,
 };
-use crate::transport::SshTransport;
+use crate::remote::{Request as RemoteRequest, StateTimes, create_backup};
+use crate::transport::{RemoteGuard, SshTransport};
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use fs2::FileExt;
@@ -14,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -54,10 +55,10 @@ impl Adapter for CodexAdapter {
                 bail!("required local command not found: {command}");
             }
         }
-        let root = SshTransport::shell_quote(remote);
-        if !transport.remote_ok(&format!("test -d {root} && command -v python3 >/dev/null && command -v tar >/dev/null && command -v codex >/dev/null"))? {
-            bail!("remote Codex root or required command is missing");
-        }
+        let _: Value = transport.remote_request(&RemoteRequest::Doctor {
+            root: remote.to_owned(),
+            agent: "codex".to_owned(),
+        })?;
         Ok(())
     }
 
@@ -636,18 +637,6 @@ fn merge_blocks(a: &str, b: &str, heading: &str) -> String {
     )
 }
 
-const ACTIVE_PY: &str = r#"import fcntl,json,os,pathlib,re,sys
-root=pathlib.Path(sys.argv[1]).expanduser(); active=[]
-for p in root.glob('thread-writer-locks/*.lock'):
- m=re.search(r'([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})',p.name)
- if not m: continue
- fd=os.open(p,os.O_RDWR)
- try:
-  try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-  except BlockingIOError: active.append(m.group(1))
-  else: fcntl.flock(fd,fcntl.LOCK_UN)
- finally: os.close(fd)
-print(json.dumps(active))"#;
 fn active_writer_ids(local: &Path, remote: &str, t: &SshTransport) -> Result<BTreeSet<String>> {
     let mut s = BTreeSet::new();
     let d = local.join("thread-writer-locks");
@@ -663,13 +652,10 @@ fn active_writer_ids(local: &Path, remote: &str, t: &SshTransport) -> Result<BTr
             }
         }
     }
-    let script = format!(
-        "python3 -c {} {}",
-        SshTransport::shell_quote(ACTIVE_PY),
-        SshTransport::shell_quote(remote)
-    );
-    let o = t.ssh(&script)?;
-    for id in serde_json::from_slice::<Vec<String>>(&o.stdout)? {
+    let remote_ids: Vec<String> = t.remote_request(&RemoteRequest::CodexActiveWriters {
+        root: remote.to_owned(),
+    })?;
+    for id in remote_ids {
         s.insert(id);
     }
     Ok(s)
@@ -685,7 +671,7 @@ fn find_uuid(s: &str) -> Option<String> {
 
 struct CodexGuards {
     local: File,
-    remote: Child,
+    remote: RemoteGuard,
 }
 impl CodexGuards {
     fn acquire(local: &Path, remote: &str, t: &SshTransport) -> Result<Self> {
@@ -698,33 +684,18 @@ impl CodexGuards {
             .write(true)
             .open(dir.join(".coordination.lock"))?;
         file.lock_exclusive()?;
-        let py = "import fcntl,os,pathlib,sys; p=pathlib.Path(sys.argv[1]).expanduser()/'thread-writer-locks/.coordination.lock';p.parent.mkdir(parents=True,exist_ok=True);f=os.open(p,os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(f,fcntl.LOCK_EX);print('ready',flush=True);sys.stdin.read()";
-        let script = format!(
-            "exec python3 -c {} {}",
-            SshTransport::shell_quote(py),
-            SshTransport::shell_quote(remote)
-        );
-        let mut child = Command::new(&t.ssh)
-            .arg(&t.host)
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line)?;
-        if line.trim() != "ready" {
-            bail!("remote coordination lock failed")
-        }
+        let remote = t.remote_guard(&RemoteRequest::HoldCoordinationLock {
+            root: remote.to_owned(),
+        })?;
         Ok(Self {
             local: file,
-            remote: child,
+            remote,
         })
     }
 }
 impl Drop for CodexGuards {
     fn drop(&mut self) {
-        let _ = self.remote.stdin.take();
-        let _ = self.remote.wait();
+        let _ = &self.remote;
         let _ = FileExt::unlock(&self.local);
     }
 }
@@ -749,22 +720,11 @@ fn backup_local(root: &Path, r: ResourceSelection, stamp: &str) -> Result<PathBu
     let d = root.join("sync-backups");
     private_dir(&d)?;
     let o = d.join(format!("before-{stamp}.tar.gz"));
-    let mut command = Command::new("tar");
-    command.args(["-czf"]).arg(&o).arg("-C").arg(root);
-    for member in backup_members(r) {
-        if root.join(member).exists() {
-            command.arg(member);
-        }
-    }
-    let status = command.status()?;
-    if !status.success() {
-        bail!("local Codex backup failed")
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&o, fs::Permissions::from_mode(0o600))?;
-    }
+    let members = backup_members(r)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    create_backup(root, &o, &members)?;
     Ok(o)
 }
 fn backup_remote(
@@ -773,33 +733,17 @@ fn backup_remote(
     stamp: &str,
     t: &SshTransport,
 ) -> Result<String> {
-    let d = format!("{root}/sync-backups");
-    let o = format!("{d}/before-{stamp}.tar.gz");
-    let python = r#"import pathlib,sys,tarfile
-root=pathlib.Path(sys.argv[1]).expanduser();out=pathlib.Path(sys.argv[2]).expanduser();members=sys.argv[3:]
-out.parent.mkdir(parents=True,exist_ok=True);partial=pathlib.Path(str(out)+'.partial')
-try:
- with tarfile.open(partial,'w:gz') as tar:
-  for name in members:
-   path=root/name
-   if path.exists():tar.add(path,arcname=name)
- partial.chmod(0o600);partial.replace(out)
-finally:
- partial.unlink(missing_ok=True)"#;
-    let args = backup_members(r)
-        .into_iter()
-        .map(SshTransport::shell_quote)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let s = format!(
-        "python3 -c {} {} {} {}",
-        SshTransport::shell_quote(python),
-        SshTransport::shell_quote(root),
-        SshTransport::shell_quote(&o),
-        args
-    );
-    t.ssh(&s)?;
-    Ok(o)
+    #[derive(Deserialize)]
+    struct BackupResult {
+        path: String,
+    }
+    let value: BackupResult = t.remote_request(&RemoteRequest::Backup {
+        root: root.to_owned(),
+        backup_dir: "sync-backups".to_owned(),
+        stamp: stamp.to_owned(),
+        members: backup_members(r).into_iter().map(str::to_owned).collect(),
+    })?;
+    Ok(value.path)
 }
 fn install_local(stage: &Path, root: &Path, rsync: &str) -> Result<()> {
     let status = Command::new(rsync)
@@ -940,25 +884,6 @@ fn repair_state(root: &Path, m: &BTreeMap<String, Times>) -> Result<usize> {
     tx.commit()?;
     Ok(changed)
 }
-const STATE_PY: &str = r#"import json,pathlib,re,sqlite3,sys
-root=pathlib.Path(sys.argv[1]).expanduser(); stamp=sys.argv[2]; mode=sys.argv[3]
-c=[]
-for p in root.glob('state_*.sqlite'):
- m=re.fullmatch(r'state_(\d+)\.sqlite',p.name)
- if m:c.append((int(m.group(1)),p))
-if not c:raise SystemExit('no state db')
-db=max(c)[1];backup=root/'sync-backups'/f'state-before-{stamp}.sqlite'
-if mode=='backup':
- backup.parent.mkdir(parents=True,exist_ok=True)
- with sqlite3.connect(db) as s,sqlite3.connect(backup) as d:s.backup(d)
- backup.chmod(0o600);print(backup)
-else:
- data=json.load(sys.stdin);changed=0
- with sqlite3.connect(db) as con:
-  for sid,v in data.items():
-   c=con.execute('UPDATE threads SET created_at=?,created_at_ms=?,updated_at=?,updated_at_ms=?,recency_at=?,recency_at_ms=? WHERE id=? AND (created_at_ms!=? OR updated_at_ms!=? OR recency_at_ms!=?)',(v['created_at_ms']//1000,v['created_at_ms'],v['updated_at_ms']//1000,v['updated_at_ms'],v['recency_at_ms']//1000,v['recency_at_ms'],sid,v['created_at_ms'],v['updated_at_ms'],v['recency_at_ms']))
-   changed+=c.rowcount
- print(changed)"#;
 fn remote_state(
     t: &SshTransport,
     root: &str,
@@ -966,35 +891,37 @@ fn remote_state(
     mode: &str,
     data: Option<&BTreeMap<String, Times>>,
 ) -> Result<String> {
-    let script = format!(
-        "python3 -c {} {} {} {}",
-        SshTransport::shell_quote(STATE_PY),
-        SshTransport::shell_quote(root),
-        SshTransport::shell_quote(stamp),
-        SshTransport::shell_quote(mode)
-    );
-    let mut c = Command::new(&t.ssh);
-    c.arg(&t.host)
-        .arg(script)
-        .stdin(if data.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = c.spawn()?;
-    if let Some(d) = data {
-        serde_json::to_writer(child.stdin.as_mut().unwrap(), d)?;
+    let times = data.map(|items| {
+        items
+            .iter()
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    StateTimes {
+                        created_at_ms: value.created_at_ms,
+                        updated_at_ms: value.updated_at_ms,
+                        recency_at_ms: value.recency_at_ms,
+                    },
+                )
+            })
+            .collect()
+    });
+    let value: Value = t.remote_request(&RemoteRequest::CodexState {
+        root: root.to_owned(),
+        stamp: stamp.to_owned(),
+        times,
+    })?;
+    match mode {
+        "backup" => value["path"]
+            .as_str()
+            .map(str::to_owned)
+            .context("remote state backup omitted path"),
+        "repair" => value["changed"]
+            .as_u64()
+            .map(|value| value.to_string())
+            .context("remote state repair omitted count"),
+        _ => bail!("unknown remote state mode: {mode}"),
     }
-    let o = child.wait_with_output()?;
-    if !o.status.success() {
-        bail!(
-            "remote state operation failed: {}",
-            String::from_utf8_lossy(&o.stderr)
-        )
-    }
-    Ok(String::from_utf8(o.stdout)?.trim().to_owned())
 }
 
 #[cfg(test)]

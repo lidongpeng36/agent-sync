@@ -1,8 +1,9 @@
 # agent-sync
 
 `agent-sync` safely synchronizes coding-agent sessions and memories between a
-local machine and an SSH peer. It ships as one local Rust binary; the peer does
-not need agent-sync installed.
+local machine and an SSH peer. It ships as one local Rust binary and
+automatically bootstraps a private, versioned copy of itself on a compatible
+peer.
 
 Built-in adapters:
 
@@ -65,11 +66,22 @@ Precedence is CLI, configuration, then adapter defaults.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
 - Session mtimes come from the last event rather than transfer time.
+- Remote filesystem, lock, backup, mtime, and SQLite operations use a versioned
+  typed protocol implemented by the same Rust binary; no Python source is sent
+  to the peer.
 
 The binary uses the existing SSH configuration and does not weaken host-key
-checking. Runtime dependencies are `ssh`, `rsync`, `tar`, and `python3` on both
-machines; Claude writer detection also needs `lsof`, and Codex catalog repair
-needs a compatible `codex app-server`.
+checking. It invokes OpenSSH so aliases, ProxyJump, ControlMaster, ssh-agent,
+and `known_hosts` continue to work. The helper is checksum-verified and stored
+with private permissions below
+`~/.cache/agent-sync/remotes/<version>/agent-sync`; bootstrapping currently
+requires the peer to have the same OS and CPU architecture as the local binary.
+
+Runtime dependencies are `ssh` and `rsync` locally. Claude writer detection
+also needs `lsof` on both machines, and Codex catalog repair needs a compatible
+`codex app-server` on both machines. Backup creation, timestamp handling,
+locking, and SQLite maintenance are implemented in Rust and do not require
+`tar` or `python3`.
 
 ## Development
 

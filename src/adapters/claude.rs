@@ -3,6 +3,7 @@ use crate::core::{
     Blocker, PlanReport, ResourceSelection, SyncOptions, cache_path, copy_file_atomic, fingerprint,
     manifest, private_dir, safe_relative, sha256, stamp,
 };
+use crate::remote::{MtimeUpdate, Request as RemoteRequest, create_backup};
 use crate::transport::SshTransport;
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
@@ -57,10 +58,10 @@ impl Adapter for ClaudeAdapter {
                 bail!("required local command not found: {command}");
             }
         }
-        let root = SshTransport::shell_quote(remote);
-        if !transport.remote_ok(&format!("test -d {root} && command -v python3 >/dev/null && command -v tar >/dev/null && command -v lsof >/dev/null"))? {
-            bail!("remote Claude root or required command is missing");
-        }
+        let _: Value = transport.remote_request(&RemoteRequest::Doctor {
+            root: remote.to_owned(),
+            agent: "claude".to_owned(),
+        })?;
         Ok(())
     }
 
@@ -250,26 +251,10 @@ fn refresh_remote_mtimes(
     snapshot: &Path,
     resources: ResourceSelection,
 ) -> Result<()> {
-    let python = r#"import json,os,pathlib,sys
-root=pathlib.Path(sys.argv[1]).expanduser(); include_memory=sys.argv[2]=='1'; out={}
-base=root/'projects'
-if base.exists():
- for current,dirs,files in os.walk(base):
-  p=pathlib.Path(current)
-  rel=p.relative_to(base)
-  if len(rel.parts)>=2 and rel.parts[1]=='memory' and not include_memory:
-   dirs[:]=[];continue
-  for name in files:
-   path=p/name;out[(pathlib.Path('projects')/rel/name).as_posix()]=path.stat().st_mtime_ns
-print(json.dumps(out,separators=(',',':')))"#;
-    let script = format!(
-        "python3 -c {} {} {}",
-        SshTransport::shell_quote(python),
-        SshTransport::shell_quote(root),
-        if resources.memory() { "1" } else { "0" }
-    );
-    let output = transport.ssh(&script)?;
-    let mtimes: BTreeMap<String, i64> = serde_json::from_slice(&output.stdout)?;
+    let mtimes: BTreeMap<String, i64> = transport.remote_request(&RemoteRequest::ClaudeMtimes {
+        root: root.to_owned(),
+        include_memory: resources.memory(),
+    })?;
     for (relative, ns) in mtimes {
         let relative = PathBuf::from(relative);
         safe_relative(&relative)?;
@@ -781,19 +766,10 @@ fn ensure_no_writers(local: &Path, remote: &str, transport: &SshTransport) -> Re
     if !parse_lsof_writers(&String::from_utf8_lossy(&local_out.stdout)).is_empty() {
         bail!("local Claude files are open")
     }
-    let python = r#"import re,subprocess,sys
-p=subprocess.run(['lsof','-Fpf','+D',sys.argv[1]],text=True,capture_output=True)
-cur=None; writers=set()
-for line in p.stdout.splitlines():
- if line.startswith('p'): cur=line[1:]
- elif cur and re.fullmatch(r'f\d+[wu].*',line): writers.add(cur)
-raise SystemExit(1 if writers else 0)"#;
-    let script = format!(
-        "python3 -c {} {}/projects",
-        SshTransport::shell_quote(python),
-        SshTransport::shell_quote(remote)
-    );
-    if !transport.remote_ok(&script)? {
+    let value: Value = transport.remote_request(&RemoteRequest::ClaudeWriters {
+        root: remote.to_owned(),
+    })?;
+    if value["active"].as_bool().unwrap_or(true) {
         bail!("remote Claude files are open")
     }
     Ok(())
@@ -829,18 +805,11 @@ fn verify_event_mtimes(root: &Path, side: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-struct MtimeRequest {
-    path: String,
-    sha256: String,
-    mtime_ns: i64,
-}
-
-fn mtime_requests(stage: &Path) -> Result<Vec<MtimeRequest>> {
+fn mtime_requests(stage: &Path) -> Result<Vec<MtimeUpdate>> {
     let mut requests = Vec::new();
     for (path, file) in session_files(stage)? {
         if let Some(event) = file.event_ns {
-            requests.push(MtimeRequest {
+            requests.push(MtimeUpdate {
                 path: path.to_string_lossy().into_owned(),
                 sha256: file.sha,
                 mtime_ns: event,
@@ -872,35 +841,10 @@ fn normalize_local_mtimes(stage: &Path, root: &Path) -> Result<()> {
 
 fn normalize_remote_mtimes(stage: &Path, root: &str, transport: &SshTransport) -> Result<()> {
     let requests = mtime_requests(stage)?;
-    let python = r#"import hashlib,json,os,pathlib,sys
-root=pathlib.Path(sys.argv[1]).expanduser()
-for item in json.load(sys.stdin):
- p=root/pathlib.PurePosixPath(item['path'])
- if hashlib.sha256(p.read_bytes()).hexdigest()!=item['sha256']: raise SystemExit('content changed: '+item['path'])
- ns=int(item['mtime_ns']);os.utime(p,ns=(ns,ns))"#;
-    let script = format!(
-        "python3 -c {} {}",
-        SshTransport::shell_quote(python),
-        SshTransport::shell_quote(root)
-    );
-    let mut child = Command::new(&transport.ssh)
-        .arg(&transport.host)
-        .arg(script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    serde_json::to_writer(
-        child.stdin.as_mut().context("remote mtime stdin")?,
-        &requests,
-    )?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "remote mtime normalization failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let _: Value = transport.remote_request(&RemoteRequest::SetMtimes {
+        root: root.to_owned(),
+        items: requests,
+    })?;
     Ok(())
 }
 
@@ -908,18 +852,8 @@ fn backup_local(root: &Path, resources: ResourceSelection, stamp: &str) -> Resul
     let dir = root.join("agent-sync-backups");
     private_dir(&dir)?;
     let out = dir.join(format!("before-{stamp}.tar.gz"));
-    let mut c = Command::new("tar");
-    c.args(["-czf"]).arg(&out).arg("-C").arg(root);
     let _ = resources;
-    c.arg("projects");
-    if !c.status()?.success() {
-        bail!("local backup failed")
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
-    }
+    create_backup(root, &out, &["projects".to_owned()])?;
     Ok(out)
 }
 fn backup_remote(
@@ -928,16 +862,17 @@ fn backup_remote(
     stamp: &str,
     t: &SshTransport,
 ) -> Result<String> {
-    let d = format!("{root}/agent-sync-backups");
-    let out = format!("{d}/before-{stamp}.tar.gz");
-    let s = format!(
-        "set -e; umask 077; mkdir -p {d}; tar -czf {o}.partial -C {r} projects; tar -tzf {o}.partial >/dev/null; mv {o}.partial {o}",
-        d = SshTransport::shell_quote(&d),
-        o = SshTransport::shell_quote(&out),
-        r = SshTransport::shell_quote(root)
-    );
-    t.ssh(&s)?;
-    Ok(out)
+    #[derive(serde::Deserialize)]
+    struct BackupResult {
+        path: String,
+    }
+    let value: BackupResult = t.remote_request(&RemoteRequest::Backup {
+        root: root.to_owned(),
+        backup_dir: "agent-sync-backups".to_owned(),
+        stamp: stamp.to_owned(),
+        members: vec!["projects".to_owned()],
+    })?;
+    Ok(value.path)
 }
 fn install_local(
     stage: &Path,

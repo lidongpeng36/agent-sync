@@ -1,6 +1,7 @@
 mod adapters;
 mod config;
 mod core;
+mod remote;
 mod transport;
 
 use anyhow::{Context, Result, bail};
@@ -43,6 +44,15 @@ enum Command {
     Doctor(TargetArgs),
     /// List built-in adapters and their capabilities.
     Adapters,
+    /// Internal typed RPC endpoint used over SSH.
+    #[command(name = "__remote", hide = true)]
+    Remote(RemoteArgs),
+}
+
+#[derive(Args)]
+struct RemoteArgs {
+    #[arg(long)]
+    protocol: u32,
 }
 
 #[derive(Args)]
@@ -144,8 +154,11 @@ fn confirm(args: &SyncArgs) -> Result<()> {
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
-    let config = Config::load(cli.config.as_deref())?;
     match cli.command {
+        Command::Remote(args) => {
+            remote::serve(args.protocol)?;
+            Ok(0)
+        }
         Command::Adapters => {
             let values = [
                 AdapterInfo {
@@ -161,6 +174,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Command::Doctor(args) => {
+            let config = Config::load(cli.config.as_deref())?;
             let (local, remote, transport) = resolve_target(&args, &config)?;
             let adapter = adapter_for(args.agent);
             adapter.doctor(&local, &remote, &transport)?;
@@ -168,6 +182,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Command::Sync(args) => {
+            let config = Config::load(cli.config.as_deref())?;
             let (local_root, remote_root, transport) = resolve_target(&args.target, &config)?;
             let resources = match args.only {
                 None => ResourceSelection::All,
