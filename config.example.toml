@@ -1,0 +1,16 @@
+version = 1
+
+[peers.mini]
+host = "mini"
+ssh = "/usr/bin/ssh"
+rsync = "rsync"
+
+[agents.codex]
+local_root = "~/.codex"
+
+[agents.claude]
+local_root = "~/.claude"
+
+[peers.mini.roots]
+codex = ".codex"
+claude = ".claude"
