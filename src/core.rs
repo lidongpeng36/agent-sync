@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::ValueEnum;
+use fs2::FileExt;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -8,8 +9,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
@@ -25,6 +27,135 @@ pub enum ResourceSelection {
     All,
     Sessions,
     Memory,
+}
+
+pub enum InteractiveChoice<T> {
+    Local,
+    Remote,
+    Edited(T),
+}
+
+pub struct EditDocument<'a> {
+    pub name: &'a str,
+    pub local: &'a [u8],
+    pub remote: &'a [u8],
+    pub remote_label: &'a str,
+}
+
+pub fn file_lock_is_held(file: &File) -> Result<bool> {
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(file)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error).context("probe writer lock"),
+    }
+}
+
+fn conflict_markers(local: &str, remote: &str, remote_label: &str) -> String {
+    format!(
+        "<<<<<<< LOCAL\n{}{}=======\n{}{}>>>>>>> {remote_label}\n",
+        local,
+        if local.ends_with('\n') { "" } else { "\n" },
+        remote,
+        if remote.ends_with('\n') { "" } else { "\n" },
+    )
+}
+
+fn has_conflict_markers(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.starts_with("<<<<<<< ") || line == "=======" || line.starts_with(">>>>>>> ")
+    })
+}
+
+pub fn choose_interactively<T>(
+    heading: &str,
+    local_label: &str,
+    remote_label: &str,
+    mut edit: impl FnMut() -> Result<T>,
+) -> Result<InteractiveChoice<T>> {
+    println!("{heading}");
+    println!("  [l] {local_label}");
+    println!("  [r] {remote_label}");
+    loop {
+        print!("choose [l]ocal / [r]emote / [e]dit / [q]uit: ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer)? == 0 {
+            bail!("cancelled by user");
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "l" | "local" => return Ok(InteractiveChoice::Local),
+            "r" | "remote" => return Ok(InteractiveChoice::Remote),
+            "e" | "edit" => match edit() {
+                Ok(value) => return Ok(InteractiveChoice::Edited(value)),
+                Err(error) => println!("edit not accepted: {error:#}"),
+            },
+            "q" | "quit" => bail!("cancelled by user"),
+            _ => println!("Please choose l, r, e, or q."),
+        }
+    }
+}
+
+pub fn edit_conflict_documents(
+    root: &Path,
+    documents: &[EditDocument<'_>],
+) -> Result<Vec<Vec<u8>>> {
+    private_dir(root)?;
+    let mut paths = Vec::new();
+    for document in documents {
+        let local =
+            std::str::from_utf8(document.local).context("local conflict content is not UTF-8")?;
+        let remote =
+            std::str::from_utf8(document.remote).context("remote conflict content is not UTF-8")?;
+        let content = if local == remote {
+            local.to_owned()
+        } else {
+            conflict_markers(local, remote, document.remote_label)
+        };
+        let path = root.join(document.name);
+        fs::write(&path, content)?;
+        paths.push(path);
+    }
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".into());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().context("editor command is empty")?;
+    println!(
+        "opening {} with {editor}",
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" and ")
+    );
+    let status = Command::new(program)
+        .args(parts)
+        .args(&paths)
+        .status()
+        .with_context(|| format!("start editor {program}"))?;
+    if !status.success() {
+        bail!("editor exited with {status}");
+    }
+    paths
+        .iter()
+        .map(|path| {
+            let bytes = fs::read(path)?;
+            let text = std::str::from_utf8(&bytes).context("edited content is not UTF-8")?;
+            if has_conflict_markers(text) {
+                bail!("conflict markers remain; resolve all <<<<<<<, =======, and >>>>>>> lines");
+            }
+            Ok(bytes)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize, ValueEnum)]
@@ -220,6 +351,14 @@ impl PlanReport {
             writeln!(output, "  ? {display_path}").unwrap();
             writeln!(output, "    {}", blocker_explanation(blocker)).unwrap();
         }
+        let has_choice = self
+            .blockers
+            .iter()
+            .any(|blocker| blocker.reason.contains("requires a choice"));
+        let has_active_writer = self
+            .blockers
+            .iter()
+            .any(|blocker| blocker.reason.contains("active"));
         writeln!(output, "next steps:").unwrap();
         writeln!(
             output,
@@ -227,29 +366,47 @@ impl PlanReport {
             self.agent, self.peer
         )
         .unwrap();
-        writeln!(
-            output,
-            "  resolve per conflict:      agent-sync sync {} {} -s ask --apply",
-            self.agent, self.peer
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "    choose l (local), r (remote), or e ($EDITOR), then confirm with [Y/n]"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "  use local for all:         agent-sync sync {} {} -s local --apply",
-            self.agent, self.peer
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "  use remote for all:        agent-sync sync {} {} -s remote --apply",
-            self.agent, self.peer
-        )
-        .unwrap();
+        if has_choice {
+            writeln!(
+                output,
+                "  resolve per conflict:      agent-sync sync {} {} --apply",
+                self.agent, self.peer
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "    choose l (local), r (remote), or e ($EDITOR), then confirm with [Y/n]"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "  use local for all:         agent-sync sync {} {} -s local --apply",
+                self.agent, self.peer
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "  use remote for all:        agent-sync sync {} {} -s remote --apply",
+                self.agent, self.peer
+            )
+            .unwrap();
+        }
+        if has_active_writer {
+            writeln!(
+                output,
+                "  after closing the writer:  agent-sync sync {} {} --apply",
+                self.agent, self.peer
+            )
+            .unwrap();
+            if self.resources.iter().any(|resource| resource == "memory") {
+                writeln!(
+                    output,
+                    "  sync memory meanwhile:     agent-sync sync {} {} --only memory --apply",
+                    self.agent, self.peer
+                )
+                .unwrap();
+            }
+        }
         writeln!(output, "status: action required; no files changed").unwrap();
         output
     }
@@ -795,6 +952,16 @@ pub fn copy_file_atomic(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_editor_uses_git_style_conflict_markers() {
+        let text = conflict_markers("local\n", "remote\n", "REMOTE mini");
+        assert!(text.starts_with("<<<<<<< LOCAL\n"));
+        assert!(text.contains("\n=======\n"));
+        assert!(text.ends_with(">>>>>>> REMOTE mini\n"));
+        assert!(has_conflict_markers(&text));
+        assert!(!has_conflict_markers("resolved\n"));
+    }
     #[test]
     fn rejects_unsafe_relative_paths() {
         assert!(safe_relative(Path::new("a/b")).is_ok());
@@ -877,9 +1044,34 @@ mod tests {
         assert!(rendered.contains("? choose"));
         assert!(rendered.contains("action required (1):"));
         assert!(rendered.contains("agent-sync sync claude mini -f diff"));
+        assert!(rendered.contains("agent-sync sync claude mini --apply"));
         assert!(rendered.contains("-s local --apply"));
+        assert!(!rendered.contains("-s ask --apply"));
         assert!(!rendered.contains("BLOCKED"));
         assert!(!rendered.contains("result=unresolved"));
+    }
+
+    #[test]
+    fn blocking_writer_guidance_does_not_claim_conflict_strategy_can_resolve_it() {
+        let report = PlanReport {
+            agent: "opencode".into(),
+            peer: "mini".into(),
+            resources: vec!["sessions".into()],
+            blockers: vec![Blocker {
+                resource: "sessions".into(),
+                path: "opencode.db".into(),
+                reason: "active OpenCode writers must exit before apply".into(),
+            }],
+            ..PlanReport::default()
+        };
+
+        let rendered = report.render_human();
+        assert!(rendered.contains("after closing the writer:"));
+        assert!(!rendered.contains("--only memory --apply"));
+        assert!(!rendered.contains("resolve per conflict:"));
+        assert!(!rendered.contains("-s ask"));
+        assert!(!rendered.contains("-s local"));
+        assert!(!rendered.contains("-s remote"));
     }
 
     #[test]

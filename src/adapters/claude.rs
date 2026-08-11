@@ -1,7 +1,8 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, ConflictStrategy, PlanReport, ResourceSelection, SyncOptions, bytes_sha256,
-    cache_path, copy_file_atomic, fingerprint, manifest, planned_file_changes, print_planned_diff,
+    Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PlanReport, ResourceSelection,
+    SyncOptions, bytes_sha256, cache_path, choose_interactively, copy_file_atomic,
+    edit_conflict_documents, fingerprint, manifest, planned_file_changes, print_planned_diff,
     private_dir, safe_relative, sha256, stamp,
 };
 use crate::remote::{MtimeUpdate, Request as RemoteRequest, create_backup};
@@ -13,7 +14,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -80,22 +81,6 @@ enum Side {
     Remote,
 }
 
-fn conflict_markers(local: &str, remote: &str, peer: &str) -> String {
-    format!(
-        "<<<<<<< LOCAL\n{}{}=======\n{}{}>>>>>>> REMOTE {peer}\n",
-        local,
-        if local.ends_with('\n') { "" } else { "\n" },
-        remote,
-        if remote.ends_with('\n') { "" } else { "\n" },
-    )
-}
-
-fn has_conflict_markers(content: &str) -> bool {
-    content.lines().any(|line| {
-        line.starts_with("<<<<<<< ") || line == "=======" || line.starts_with(">>>>>>> ")
-    })
-}
-
 fn edit_memory_conflict(
     conflict: &MemoryConflict,
     root: &Path,
@@ -105,62 +90,64 @@ fn edit_memory_conflict(
     let directory = root.join(&conflict.project).join(&conflict.target);
     private_dir(&directory)?;
     let content_path = directory.join(&conflict.target);
-    let index_path = directory.join("MEMORY-entry.md");
     let staged_content = stage
         .join("projects")
         .join(&conflict.project)
         .join("memory")
         .join(&conflict.target);
-    let content = if conflict.content_requires_choice {
-        conflict_markers(&conflict.local_content, &conflict.remote_content, peer)
+    let (local_content, remote_content) = if conflict.content_requires_choice {
+        (
+            conflict.local_content.as_bytes().to_vec(),
+            conflict.remote_content.as_bytes().to_vec(),
+        )
     } else {
-        fs::read_to_string(staged_content)?
+        let staged = fs::read(staged_content)?;
+        (staged.clone(), staged)
     };
-    let index = if conflict.index_requires_choice {
-        conflict_markers(&conflict.local_index, &conflict.remote_index, peer)
+    let (local_index, remote_index) = if conflict.index_requires_choice {
+        (
+            conflict.local_index.as_bytes().to_vec(),
+            conflict.remote_index.as_bytes().to_vec(),
+        )
     } else if !conflict.local_index.is_empty() {
-        conflict.local_index.clone()
+        let index = conflict.local_index.as_bytes().to_vec();
+        (index.clone(), index)
     } else {
-        conflict.remote_index.clone()
+        let index = conflict.remote_index.as_bytes().to_vec();
+        (index.clone(), index)
     };
-    fs::write(&content_path, content)?;
-    fs::write(&index_path, index)?;
+    let remote_label = format!("REMOTE {peer}");
+    let edited = edit_conflict_documents(
+        &directory,
+        &[
+            EditDocument {
+                name: &conflict.target,
+                local: &local_content,
+                remote: &remote_content,
+                remote_label: &remote_label,
+            },
+            EditDocument {
+                name: "MEMORY-entry.md",
+                local: &local_index,
+                remote: &remote_index,
+                remote_label: &remote_label,
+            },
+        ],
+    )?;
+    validate_edited_memory(conflict, &content_path, edited)
+}
 
-    let editor = std::env::var("VISUAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "vi".into());
-    let mut parts = editor.split_whitespace();
-    let program = parts.next().context("editor command is empty")?;
-    println!(
-        "opening {} and {} with {editor}",
-        content_path.display(),
-        index_path.display()
-    );
-    let status = Command::new(program)
-        .args(parts)
-        .arg(&content_path)
-        .arg(&index_path)
-        .status()
-        .with_context(|| format!("start editor {program}"))?;
-    if !status.success() {
-        bail!("editor exited with {status}");
-    }
-
-    let content = fs::read_to_string(&content_path)?;
-    let index = fs::read_to_string(&index_path)?;
-    if has_conflict_markers(&content) || has_conflict_markers(&index) {
-        bail!("conflict markers remain; resolve all <<<<<<<, =======, and >>>>>>> lines");
-    }
+fn validate_edited_memory(
+    conflict: &MemoryConflict,
+    content_path: &Path,
+    mut edited: Vec<Vec<u8>>,
+) -> Result<MemoryChoice> {
+    let index = String::from_utf8(edited.pop().context("edited memory index missing")?)?;
+    let content = String::from_utf8(edited.pop().context("edited memory content missing")?)?;
     if content.trim().is_empty() {
         bail!("edited memory content is empty");
     }
-    synthesize_block(&content_path, &conflict.target)
+    synthesize_block(content_path, &conflict.target)
         .context("edited memory must retain non-empty name and description frontmatter")?;
     let link = format!("]({})", conflict.target);
     if index.matches(&link).count() != 1 {
@@ -235,53 +222,30 @@ impl Adapter for ClaudeAdapter {
             return Ok(());
         }
         for conflict in value.conflicts.clone() {
-            println!(
-                "Claude memory conflict [{}/{}]",
-                conflict.project, conflict.target
-            );
-            println!("  [l] {}", conflict.local_index.replace('\n', " "));
-            println!("  [r] {}", conflict.remote_index.replace('\n', " "));
-            loop {
-                print!("choose [l]ocal / [r]emote / [e]dit / [q]uit: ");
-                io::stdout().flush()?;
-                let mut answer = String::new();
-                if io::stdin().read_line(&mut answer)? == 0 {
-                    bail!("cancelled by user");
-                }
-                match answer.trim().to_ascii_lowercase().as_str() {
-                    "l" | "local" => {
-                        value.choices.insert(
-                            (conflict.project.clone(), conflict.target.clone()),
-                            MemoryChoice::Side(Side::Local),
-                        );
-                        break;
-                    }
-                    "r" | "remote" => {
-                        value.choices.insert(
-                            (conflict.project.clone(), conflict.target.clone()),
-                            MemoryChoice::Side(Side::Remote),
-                        );
-                        break;
-                    }
-                    "e" | "edit" => match edit_memory_conflict(
+            let choice = choose_interactively(
+                &format!(
+                    "Claude memory conflict [{}/{}]",
+                    conflict.project, conflict.target
+                ),
+                &conflict.local_index.replace('\n', " "),
+                &conflict.remote_index.replace('\n', " "),
+                || {
+                    edit_memory_conflict(
                         &conflict,
                         &value.temp.path().join("edit"),
                         &value.stage,
                         &value.report.peer,
-                    ) {
-                        Ok(choice) => {
-                            value.choices.insert(
-                                (conflict.project.clone(), conflict.target.clone()),
-                                choice,
-                            );
-                            break;
-                        }
-                        Err(error) => println!("edit not accepted: {error:#}"),
-                    },
-                    "q" | "quit" => bail!("cancelled by user"),
-                    _ => println!("Please choose l, r, e, or q."),
-                }
-            }
+                    )
+                },
+            )?;
+            let choice = match choice {
+                InteractiveChoice::Local => MemoryChoice::Side(Side::Local),
+                InteractiveChoice::Remote => MemoryChoice::Side(Side::Remote),
+                InteractiveChoice::Edited(choice) => choice,
+            };
+            value
+                .choices
+                .insert((conflict.project.clone(), conflict.target.clone()), choice);
         }
         fs::remove_dir_all(&value.stage)?;
         private_dir(&value.stage)?;
@@ -1843,16 +1807,6 @@ mod tests {
         assert!(report.files.iter().any(|file| {
             file.path.ends_with("/memory/MEMORY.md") && file.resolution == "edited"
         }));
-    }
-
-    #[test]
-    fn editor_conflict_markers_are_git_style_and_detectable() {
-        let text = conflict_markers("local\n", "remote\n", "mini");
-        assert!(text.starts_with("<<<<<<< LOCAL\n"));
-        assert!(text.contains("\n=======\n"));
-        assert!(text.ends_with(">>>>>>> REMOTE mini\n"));
-        assert!(has_conflict_markers(&text));
-        assert!(!has_conflict_markers("resolved\n"));
     }
 
     #[test]

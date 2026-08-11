@@ -1,7 +1,9 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, PlanReport, ResourceSelection, SyncOptions, bytes_sha256, cache_path, fingerprint,
-    manifest, planned_file_changes, print_planned_diff, private_dir, stamp,
+    Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PlanReport, ResourceSelection,
+    SyncOptions, bytes_sha256, cache_path, choose_interactively, edit_conflict_documents,
+    file_lock_is_held, fingerprint, manifest, planned_file_changes, print_planned_diff,
+    private_dir, stamp,
 };
 use crate::remote::{Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
@@ -28,10 +30,21 @@ struct Times {
     recency_at_ms: i64,
 }
 
+#[derive(Clone)]
 struct Session {
     relative: PathBuf,
     lines: Vec<Vec<u8>>,
     times: Times,
+}
+
+#[derive(Clone)]
+struct CodexConflict {
+    resource: &'static str,
+    key: String,
+    local_relative: PathBuf,
+    remote_relative: PathBuf,
+    local_bytes: Vec<u8>,
+    remote_bytes: Vec<u8>,
 }
 
 pub struct CodexPrepared {
@@ -44,6 +57,8 @@ pub struct CodexPrepared {
     resources: ResourceSelection,
     metadata: BTreeMap<String, Times>,
     active: BTreeSet<String>,
+    conflicts: Vec<CodexConflict>,
+    local_root: PathBuf,
 }
 
 pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
@@ -63,7 +78,7 @@ pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
         );
     }
     print_planned_diff(local, &prepared.remote_snapshot, &prepared.stage, |path| {
-        excluded(path, prepared.resources)
+        excluded(path, prepared.resources) || active_excluded_path(path, &prepared.active)
     })
 }
 
@@ -99,25 +114,28 @@ impl Adapter for CodexAdapter {
         let stage = temp.path().join("stage");
         private_dir(&stage)?;
         let active = active_writer_ids(local, remote_root, transport)?;
-        let (mut report, metadata) = build_stage(
+        let (mut report, metadata, conflicts) = build_stage(
             local,
             &remote,
             &stage,
             options.resources,
             &active,
             &transport.host,
+            options.conflict_strategy,
         )?;
         report.files = planned_file_changes(local, &remote, &stage, |path| {
-            excluded(path, options.resources)
+            excluded(path, options.resources) || active_excluded_path(path, &active)
         })?;
-        if options.apply && options.resources.sessions() && !active.is_empty() {
-            report.blockers.push(Blocker {
-                resource: "sessions".into(),
-                path: active.iter().cloned().collect::<Vec<_>>().join(","),
-                reason: "active Codex writers must exit before apply".into(),
-            });
+        for conflict in &conflicts {
+            let local_path = conflict.local_relative.to_string_lossy();
+            let remote_path = conflict.remote_relative.to_string_lossy();
+            for file in &mut report.files {
+                if file.path == local_path || file.path == remote_path {
+                    file.resolution = "unresolved".into();
+                }
+            }
         }
-        let exclude = |p: &Path| excluded(p, options.resources);
+        let exclude = |p: &Path| excluded(p, options.resources) || active_excluded_path(p, &active);
         let remote_fingerprint = fingerprint(&remote, exclude)?;
         Ok(Prepared::Codex(CodexPrepared {
             report,
@@ -129,10 +147,60 @@ impl Adapter for CodexAdapter {
             resources: options.resources,
             metadata,
             active,
+            conflicts,
+            local_root: local.to_path_buf(),
         }))
     }
 
-    fn resolve_interactive(&self, _prepared: &mut Prepared, _tty: bool) -> Result<()> {
+    fn resolve_interactive(&self, prepared: &mut Prepared, tty: bool) -> Result<()> {
+        let Prepared::Codex(value) = prepared else {
+            bail!("adapter/prepared plan mismatch");
+        };
+        if value.conflicts.is_empty() || !tty {
+            return Ok(());
+        }
+        let mut edited = BTreeSet::new();
+        for conflict in value.conflicts.clone() {
+            let choice = choose_interactively(
+                &format!("Codex {} conflict [{}]", conflict.resource, conflict.key),
+                &conflict.local_relative.display().to_string(),
+                &conflict.remote_relative.display().to_string(),
+                || edit_codex_conflict(&conflict, &value.temp.path().join("edit")),
+            )?;
+            let (relative, bytes, was_edited) = match choice {
+                InteractiveChoice::Local => (
+                    conflict.local_relative.clone(),
+                    conflict.local_bytes.clone(),
+                    false,
+                ),
+                InteractiveChoice::Remote => (
+                    conflict.remote_relative.clone(),
+                    conflict.remote_bytes.clone(),
+                    false,
+                ),
+                InteractiveChoice::Edited(bytes) => (conflict.local_relative.clone(), bytes, true),
+            };
+            stage_codex_choice(value, &conflict, &relative, &bytes)?;
+            if was_edited {
+                edited.insert(relative.to_string_lossy().into_owned());
+            }
+        }
+        value
+            .report
+            .blockers
+            .retain(|blocker| !blocker.reason.contains("requires a choice"));
+        value.report.files = planned_file_changes(
+            &value.local_root,
+            &value.remote_snapshot,
+            &value.stage,
+            |path| excluded(path, value.resources) || active_excluded_path(path, &value.active),
+        )?;
+        for file in &mut value.report.files {
+            if edited.contains(&file.path) {
+                file.resolution = "edited".into();
+            }
+        }
+        value.conflicts.clear();
         Ok(())
     }
 
@@ -147,19 +215,25 @@ impl Adapter for CodexAdapter {
         let Prepared::Codex(value) = prepared else {
             bail!("adapter/prepared plan mismatch");
         };
-        if value.resources.sessions() && !value.active.is_empty() {
-            bail!("refusing apply while Codex writers are active");
-        }
-        let exclude = |p: &Path| excluded(p, value.resources);
+        let exclude =
+            |p: &Path| excluded(p, value.resources) || active_excluded_path(p, &value.active);
         let _guard = if value.resources.sessions() {
             Some(CodexGuards::acquire(local, remote_root, transport)?)
         } else {
             None
         };
-        if value.resources.sessions()
-            && !active_writer_ids(local, remote_root, transport)?.is_empty()
-        {
-            bail!("a Codex writer became active after preview");
+        if value.resources.sessions() {
+            let current_active = active_writer_ids(local, remote_root, transport)?;
+            let newly_active = current_active
+                .difference(&value.active)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !newly_active.is_empty() {
+                bail!(
+                    "new Codex writers became active after preview ({}); rerun sync so they can be excluded",
+                    newly_active.join(",")
+                );
+            }
         }
         if fingerprint(local, exclude)? != value.local_fingerprint {
             bail!("local Codex data changed after preview");
@@ -169,14 +243,14 @@ impl Adapter for CodexAdapter {
         if fingerprint(&check, exclude)? != value.remote_fingerprint {
             bail!("remote Codex data changed after preview");
         }
-        if value.resources.sessions() {
+        if value.resources.sessions() && value.active.is_empty() {
             reconcile_catalog(None, false)?;
             reconcile_catalog(Some(transport), false)?;
         }
         let stamp = stamp();
         let local_backup = backup_local(local, value.resources, &stamp)?;
         let remote_backup = backup_remote(remote_root, value.resources, &stamp, transport)?;
-        if value.resources.sessions() {
+        if value.resources.sessions() && value.active.is_empty() {
             backup_state(local, &stamp)?;
             remote_state(transport, remote_root, &stamp, "backup", None)?;
         }
@@ -184,10 +258,16 @@ impl Adapter for CodexAdapter {
         transport.push(&value.stage, remote_root)?;
         let verified = value.temp.path().join("remote-verified");
         pull_codex(transport, remote_root, &verified, value.resources)?;
-        verify_selected(&value.stage, local, value.resources, "local")?;
-        verify_selected(&value.stage, &verified, value.resources, "remote")?;
+        verify_selected(&value.stage, local, value.resources, &value.active, "local")?;
+        verify_selected(
+            &value.stage,
+            &verified,
+            value.resources,
+            &value.active,
+            "remote",
+        )?;
         drop(_guard);
-        if value.resources.sessions() {
+        if value.resources.sessions() && value.active.is_empty() {
             let local_count = reconcile_catalog(None, true)?;
             let remote_count = reconcile_catalog(Some(transport), true)?;
             let local_changed = repair_state(local, &value.metadata)?;
@@ -202,6 +282,12 @@ impl Adapter for CodexAdapter {
                 "catalog: local={local_count}, remote={remote_count}; times repaired: local={local_changed}, remote={remote_changed}"
             );
         }
+        if !value.active.is_empty() {
+            println!(
+                "warning: skipped active Codex sessions {}; history/index and catalog repair deferred",
+                value.active.iter().cloned().collect::<Vec<_>>().join(",")
+            );
+        }
         println!(
             "complete: Codex synchronized and verified; backups: local={}, remote={}:{}",
             local_backup.display(),
@@ -210,6 +296,72 @@ impl Adapter for CodexAdapter {
         );
         Ok(())
     }
+}
+
+fn edit_codex_conflict(conflict: &CodexConflict, root: &Path) -> Result<Vec<u8>> {
+    let name = conflict
+        .local_relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("conflict path has no UTF-8 filename")?;
+    let mut edited = edit_conflict_documents(
+        root,
+        &[EditDocument {
+            name,
+            local: &conflict.local_bytes,
+            remote: &conflict.remote_bytes,
+            remote_label: "REMOTE",
+        }],
+    )?;
+    let bytes = edited.remove(0);
+    if conflict.resource == "session" {
+        validate_session_choice(&conflict.local_relative, &conflict.key, &bytes)?;
+    }
+    Ok(bytes)
+}
+
+fn validate_session_choice(relative: &Path, expected_id: &str, bytes: &[u8]) -> Result<Times> {
+    let lines = split_lines(bytes)?;
+    let (id, times) = validate_rollout(relative, &lines)?;
+    if id != expected_id {
+        bail!("edited rollout session id changed from {expected_id} to {id}");
+    }
+    Ok(times)
+}
+
+fn stage_codex_choice(
+    prepared: &mut CodexPrepared,
+    conflict: &CodexConflict,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    if conflict.local_relative != relative {
+        let old = prepared.stage.join(&conflict.local_relative);
+        if old.exists() {
+            fs::remove_file(old)?;
+        }
+    }
+    if conflict.remote_relative != relative {
+        let old = prepared.stage.join(&conflict.remote_relative);
+        if old.exists() {
+            fs::remove_file(old)?;
+        }
+    }
+    let target = prepared.stage.join(relative);
+    private_dir(target.parent().context("conflict target has no parent")?)?;
+    fs::write(&target, bytes)?;
+    if conflict.resource == "session" {
+        let times = validate_session_choice(relative, &conflict.key, bytes)?;
+        filetime::set_file_mtime(
+            &target,
+            filetime::FileTime::from_unix_time(
+                times.updated_at_ms / 1000,
+                ((times.updated_at_ms % 1000) * 1_000_000) as u32,
+            ),
+        )?;
+        prepared.metadata.insert(conflict.key.clone(), times);
+    }
+    Ok(())
 }
 
 fn pull_codex(t: &SshTransport, root: &str, dest: &Path, r: ResourceSelection) -> Result<()> {
@@ -253,6 +405,12 @@ fn excluded(p: &Path, r: ResourceSelection) -> bool {
         || p.to_string_lossy().contains("sync-backups")
 }
 
+fn active_excluded_path(path: &Path, active: &BTreeSet<String>) -> bool {
+    let path = path.to_string_lossy();
+    active.iter().any(|id| path.contains(id))
+        || (!active.is_empty() && matches!(path.as_ref(), "history.jsonl" | "session_index.jsonl"))
+}
+
 fn scan_sessions(root: &Path, active: &BTreeSet<String>) -> Result<BTreeMap<String, Session>> {
     let mut out = BTreeMap::new();
     for area in ["sessions", "archived_sessions"] {
@@ -267,12 +425,15 @@ fn scan_sessions(root: &Path, active: &BTreeSet<String>) -> Result<BTreeMap<Stri
             {
                 continue;
             }
+            if active
+                .iter()
+                .any(|id| e.path().to_string_lossy().contains(id))
+            {
+                continue;
+            }
             let bytes = fs::read(e.path())?;
             let lines = split_lines(&bytes)?;
             let (id, times) = validate_rollout(e.path(), &lines)?;
-            if active.contains(&id) {
-                continue;
-            }
             let rel = e.path().strip_prefix(root)?.to_path_buf();
             if out
                 .insert(
@@ -400,14 +561,17 @@ fn build_stage(
     r: ResourceSelection,
     active: &BTreeSet<String>,
     peer: &str,
-) -> Result<(PlanReport, BTreeMap<String, Times>)> {
+    strategy: ConflictStrategy,
+) -> Result<(PlanReport, BTreeMap<String, Times>, Vec<CodexConflict>)> {
     let mut report = PlanReport {
         agent: "codex".into(),
         peer: peer.into(),
         resources: Vec::new(),
+        conflict_strategy: Some(strategy),
         ..Default::default()
     };
     let mut metadata = BTreeMap::new();
+    let mut conflicts = Vec::new();
     if r.sessions() {
         report.resources.push("sessions".into());
         let a = scan_sessions(local, active)?;
@@ -436,14 +600,26 @@ fn build_stage(
                     report.advances += 1;
                     x
                 }
-                (Some(_), Some(_)) => {
-                    report.blockers.push(Blocker {
-                        resource: "sessions".into(),
-                        path: id.clone(),
-                        reason: "rollout diverged".into(),
-                    });
-                    continue;
-                }
+                (Some(x), Some(y)) => match strategy {
+                    ConflictStrategy::Local => x,
+                    ConflictStrategy::Remote => y,
+                    ConflictStrategy::Ask => {
+                        conflicts.push(CodexConflict {
+                            resource: "session",
+                            key: id.clone(),
+                            local_relative: x.relative.clone(),
+                            remote_relative: y.relative.clone(),
+                            local_bytes: x.lines.concat(),
+                            remote_bytes: y.lines.concat(),
+                        });
+                        report.blockers.push(Blocker {
+                            resource: "sessions".into(),
+                            path: id.clone(),
+                            reason: "Codex rollout requires a choice".into(),
+                        });
+                        continue;
+                    }
+                },
                 (Some(x), None) => {
                     report.remote_additions += 1;
                     x
@@ -466,27 +642,31 @@ fn build_stage(
             )?;
             metadata.insert(id, selected.times.clone());
         }
-        merge_json_file(
-            &local.join("history.jsonl"),
-            &remote.join("history.jsonl"),
-            &stage.join("history.jsonl"),
-            None,
-        )?;
-        merge_json_file(
-            &local.join("session_index.jsonl"),
-            &remote.join("session_index.jsonl"),
-            &stage.join("session_index.jsonl"),
-            Some("id"),
-        )?;
-        report
-            .notes
-            .push(format!("active sessions excluded: {}", active.len()));
+        if active.is_empty() {
+            merge_json_file(
+                &local.join("history.jsonl"),
+                &remote.join("history.jsonl"),
+                &stage.join("history.jsonl"),
+                None,
+            )?;
+            merge_json_file(
+                &local.join("session_index.jsonl"),
+                &remote.join("session_index.jsonl"),
+                &stage.join("session_index.jsonl"),
+                Some("id"),
+            )?;
+        } else {
+            report.notes.push(format!(
+                "WARNING: active sessions skipped ({}); history/index and catalog repair deferred",
+                active.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
     }
     if r.memory() {
         report.resources.push("memory".into());
-        merge_codex_memory(local, remote, stage, &mut report)?;
+        merge_codex_memory(local, remote, stage, &mut report, strategy, &mut conflicts)?;
     }
-    Ok((report, metadata))
+    Ok((report, metadata, conflicts))
 }
 fn prefix(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {
     a.len() < b.len() && a.iter().zip(b).all(|(x, y)| x == y)
@@ -535,6 +715,8 @@ fn merge_codex_memory(
     remote: &Path,
     stage: &Path,
     report: &mut PlanReport,
+    strategy: ConflictStrategy,
+    conflicts: &mut Vec<CodexConflict>,
 ) -> Result<()> {
     let a = local.join("memories");
     let b = remote.join("memories");
@@ -588,11 +770,25 @@ fn merge_codex_memory(
                         ),
                     )?
                 } else {
-                    report.blockers.push(Blocker {
-                        resource: "memory".into(),
-                        path: rel.display().to_string(),
-                        reason: "same-path memory leaf differs".into(),
-                    })
+                    match strategy {
+                        ConflictStrategy::Local => copy(&l, &out)?,
+                        ConflictStrategy::Remote => copy(&r, &out)?,
+                        ConflictStrategy::Ask => {
+                            conflicts.push(CodexConflict {
+                                resource: "memory",
+                                key: rel.display().to_string(),
+                                local_relative: Path::new("memories").join(&rel),
+                                remote_relative: Path::new("memories").join(&rel),
+                                local_bytes: lb,
+                                remote_bytes: rb,
+                            });
+                            report.blockers.push(Blocker {
+                                resource: "memory".into(),
+                                path: rel.display().to_string(),
+                                reason: "Codex memory leaf requires a choice".into(),
+                            })
+                        }
+                    }
                 }
             }
             _ => {}
@@ -677,7 +873,7 @@ fn active_writer_ids(local: &Path, remote: &str, t: &SshTransport) -> Result<BTr
             let n = e.file_name().to_string_lossy().into_owned();
             if let Some(id) = find_uuid(&n) {
                 let f = OpenOptions::new().read(true).write(true).open(e.path())?;
-                if f.try_lock_exclusive().is_err() {
+                if file_lock_is_held(&f)? {
                     s.insert(id);
                 }
             }
@@ -787,9 +983,16 @@ fn install_local(stage: &Path, root: &Path, rsync: &str) -> Result<()> {
     }
     Ok(())
 }
-fn verify_selected(stage: &Path, actual: &Path, r: ResourceSelection, side: &str) -> Result<()> {
-    let a = manifest(stage, |p| excluded(p, r))?;
-    let b = manifest(actual, |p| excluded(p, r))?;
+fn verify_selected(
+    stage: &Path,
+    actual: &Path,
+    r: ResourceSelection,
+    active: &BTreeSet<String>,
+    side: &str,
+) -> Result<()> {
+    let exclude = |p: &Path| excluded(p, r) || active_excluded_path(p, active);
+    let a = manifest(stage, exclude)?;
+    let b = manifest(actual, exclude)?;
     if a != b {
         bail!("{side} final file set or content differs from the staged manifest");
     }
@@ -969,6 +1172,25 @@ mod tests {
     }
 
     #[test]
+    fn active_rollout_is_excluded_from_the_file_plan() {
+        let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        let active = BTreeSet::from([id.to_owned()]);
+        assert!(active_excluded_path(
+            Path::new(&format!("sessions/2026/08/11/rollout-{id}.jsonl")),
+            &active
+        ));
+        assert!(!active_excluded_path(
+            Path::new("memories/MEMORY.md"),
+            &active
+        ));
+        assert!(active_excluded_path(Path::new("history.jsonl"), &active));
+        assert!(active_excluded_path(
+            Path::new("session_index.jsonl"),
+            &active
+        ));
+    }
+
+    #[test]
     fn validates_rollout_ordinals_and_times() {
         let temp = tempfile::tempdir().unwrap();
         let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
@@ -997,6 +1219,172 @@ mod tests {
         assert!(validate_rollout(&path, &lines).is_err());
     }
 
+    fn write_rollout(root: &Path, id: &str, message: &str) -> PathBuf {
+        let path = root
+            .join("sessions/2026/08/11")
+            .join(format!("rollout-2026-08-11T00-00-00-{id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"2026-08-11T00:00:00Z\"}}}}\n{{\"type\":\"event\",\"ordinal\":1,\"timestamp\":\"2026-08-11T00:01:00Z\",\"payload\":{{\"message\":\"{message}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn ask_strategy_exposes_codex_rollout_conflict_for_interactive_choice() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        write_rollout(&local, id, "local");
+        write_rollout(&remote, id, "remote");
+
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Sessions,
+            &BTreeSet::new(),
+            "mini",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, id);
+        assert!(report.blockers[0].reason.contains("requires a choice"));
+        assert!(!stage.join(&conflicts[0].local_relative).exists());
+    }
+
+    #[test]
+    fn active_codex_session_is_warned_and_skipped_without_blocking_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        let active_id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        let inactive_id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef06";
+        let active_path = write_rollout(&local, active_id, "still writing");
+        let inactive_path = write_rollout(&local, inactive_id, "stable");
+        fs::create_dir_all(&remote).unwrap();
+        fs::write(local.join("history.jsonl"), "{\"id\":\"local\"}\n").unwrap();
+        fs::write(remote.join("history.jsonl"), "{\"id\":\"remote\"}\n").unwrap();
+        let active = BTreeSet::from([active_id.to_owned()]);
+
+        let (report, metadata, conflicts) = build_stage(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Sessions,
+            &active,
+            "mini",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        assert!(report.notes.iter().any(|note| {
+            note.contains("WARNING: active sessions skipped") && note.contains(active_id)
+        }));
+        assert!(
+            !stage
+                .join(active_path.strip_prefix(&local).unwrap())
+                .exists()
+        );
+        assert!(
+            stage
+                .join(inactive_path.strip_prefix(&local).unwrap())
+                .exists()
+        );
+        assert!(!stage.join("history.jsonl").exists());
+        assert!(!stage.join("session_index.jsonl").exists());
+        assert!(!metadata.contains_key(active_id));
+        assert!(metadata.contains_key(inactive_id));
+    }
+
+    #[test]
+    fn explicit_codex_strategy_resolves_rollout_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        let local_path = write_rollout(&local, id, "local");
+        write_rollout(&remote, id, "remote");
+        for (name, strategy, expected) in [
+            ("local-stage", ConflictStrategy::Local, "local"),
+            ("remote-stage", ConflictStrategy::Remote, "remote"),
+        ] {
+            let stage = temp.path().join(name);
+            let (report, _, conflicts) = build_stage(
+                &local,
+                &remote,
+                &stage,
+                ResourceSelection::Sessions,
+                &BTreeSet::new(),
+                "mini",
+                strategy,
+            )
+            .unwrap();
+            assert!(report.blockers.is_empty());
+            assert!(conflicts.is_empty());
+            let relative = local_path.strip_prefix(&local).unwrap();
+            assert!(
+                fs::read_to_string(stage.join(relative))
+                    .unwrap()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_memory_leaf_conflict_uses_the_selected_strategy() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        fs::create_dir_all(local.join("memories/skills/example")).unwrap();
+        fs::create_dir_all(remote.join("memories/skills/example")).unwrap();
+        fs::write(local.join("memories/skills/example/SKILL.md"), "local\n").unwrap();
+        fs::write(remote.join("memories/skills/example/SKILL.md"), "remote\n").unwrap();
+
+        let ask_stage = temp.path().join("ask-stage");
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &ask_stage,
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "mini",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(report.blockers[0].reason.contains("requires a choice"));
+
+        let local_stage = temp.path().join("local-stage");
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &local_stage,
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "mini",
+            ConflictStrategy::Local,
+        )
+        .unwrap();
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            fs::read_to_string(local_stage.join("memories/skills/example/SKILL.md")).unwrap(),
+            "local\n"
+        );
+    }
+
     #[test]
     fn memory_block_merge_prefers_richer_duplicate() {
         let merged = merge_blocks(
@@ -1023,6 +1411,13 @@ mod tests {
         fs::write(actual.join("memories/.omx/state"), "private\n").unwrap();
         fs::write(actual.join("memories/nested/.git/config"), "private\n").unwrap();
 
-        verify_selected(&stage, &actual, ResourceSelection::Memory, "local").unwrap();
+        verify_selected(
+            &stage,
+            &actual,
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "local",
+        )
+        .unwrap();
     }
 }

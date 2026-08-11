@@ -1,3 +1,4 @@
+use crate::core::file_lock_is_held;
 use anyhow::{Context, Result, bail};
 use filetime::FileTime;
 use fs2::FileExt;
@@ -386,10 +387,8 @@ fn codex_active_writers(root: &Path) -> Result<Vec<String>> {
             .read(true)
             .write(true)
             .open(entry.path())?;
-        if file.try_lock_exclusive().is_err() {
+        if file_lock_is_held(&file)? {
             active.push(id.to_owned());
-        } else {
-            FileExt::unlock(&file)?;
         }
     }
     active.sort();

@@ -113,7 +113,7 @@ struct SyncArgs {
     cache_dir: Option<PathBuf>,
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Human)]
     format: Format,
-    /// Resolve irreconcilable conflicts by asking, or by preferring local/remote changes.
+    /// Resolve irreconcilable conflicts by asking or preferring one side.
     #[arg(short = 's', long, value_enum)]
     conflict_strategy: Option<ConflictStrategy>,
 }
@@ -252,7 +252,6 @@ fn run() -> Result<i32> {
             let required_resolution = prepared.blocked();
             adapter.resolve_interactive(&mut prepared, io::stdin().is_terminal())?;
             if prepared.blocked() {
-                prepared.print(output, &local_root)?;
                 return Ok(2);
             }
             if required_resolution {

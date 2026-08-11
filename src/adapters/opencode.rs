@@ -1,7 +1,7 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, FileAction, PlanReport, ResourceSelection, SyncOptions, bytes_sha256,
-    planned_file_changes, print_planned_diff, private_dir, shorten_middle, stamp,
+    Blocker, FileAction, FileChange, PlanReport, ResourceSelection, SyncOptions, bytes_sha256,
+    print_planned_diff, private_dir, shorten_middle, stamp,
 };
 use crate::remote::Request as RemoteRequest;
 use crate::transport::SshTransport;
@@ -124,7 +124,13 @@ impl SessionExport {
     }
 
     fn canonical_hash(&self) -> Result<String> {
-        Ok(bytes_sha256(&serde_json::to_vec(&self.value)?))
+        Ok(bytes_sha256(&serde_json::to_vec(&semantic_json(
+            &self.value,
+        ))?))
+    }
+
+    fn semantically_equal(&self, other: &Self) -> bool {
+        semantic_json(&self.value) == semantic_json(&other.value)
     }
 
     fn pretty(&self) -> Result<Vec<u8>> {
@@ -144,6 +150,33 @@ impl SessionExport {
             .unwrap_or_else(|| self.id());
         format!("{project}/{title}")
     }
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        Value::Object(items) => {
+            let sorted = items
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn semantic_json(value: &Value) -> Value {
+    let mut normalized = canonical_json(value);
+    if let Some(info) = normalized.get_mut("info").and_then(Value::as_object_mut) {
+        // `opencode import` assigns project location from its current working
+        // directory and may round the aggregate floating-point cost. These
+        // fields cannot round-trip between machines and are not transcript data.
+        for key in ["directory", "path", "projectID", "cost"] {
+            info.remove(key);
+        }
+    }
+    normalized
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -219,14 +252,14 @@ fn is_prefix(shorter: &SessionExport, longer: &SessionExport) -> bool {
             .messages()
             .iter()
             .zip(longer.messages())
-            .all(|(left, right)| left == right)
+            .all(|(left, right)| canonical_json(left) == canonical_json(right))
 }
 
 fn common_prefix(left: &SessionExport, right: &SessionExport) -> usize {
     left.messages()
         .iter()
         .zip(right.messages())
-        .take_while(|(left, right)| left == right)
+        .take_while(|(left, right)| canonical_json(left) == canonical_json(right))
         .count()
 }
 
@@ -307,7 +340,7 @@ fn insert_branch(
         result.insert(id, candidate);
         return Ok(());
     };
-    if existing.value == candidate.value {
+    if existing.semantically_equal(&candidate) {
         return Ok(());
     }
     if is_prefix(&existing, &candidate) {
@@ -346,7 +379,7 @@ fn merge_exports(
     }
     for id in local.keys().chain(remote.keys()).collect::<BTreeSet<_>>() {
         match (local.get(id), remote.get(id)) {
-            (Some(left), Some(right)) if left.value == right.value => report.identical += 1,
+            (Some(left), Some(right)) if left.semantically_equal(right) => report.identical += 1,
             (Some(left), Some(right)) if is_prefix(left, right) || is_prefix(right, left) => {
                 report.advances += 1;
             }
@@ -373,6 +406,60 @@ fn fingerprint(sessions: &BTreeMap<String, SessionExport>) -> Result<BTreeMap<St
         .iter()
         .map(|(id, session)| Ok((id.clone(), session.canonical_hash()?)))
         .collect()
+}
+
+fn session_action(current: Option<&SessionExport>, result: &SessionExport) -> FileAction {
+    match current {
+        None => FileAction::Create,
+        Some(current) if current.semantically_equal(result) => FileAction::Unchanged,
+        Some(_) => FileAction::Replace,
+    }
+}
+
+fn planned_session_changes(
+    local: &BTreeMap<String, SessionExport>,
+    remote: &BTreeMap<String, SessionExport>,
+    result: &BTreeMap<String, SessionExport>,
+) -> Result<Vec<FileChange>> {
+    let mut changes = Vec::new();
+    for (id, merged) in result {
+        let local_session = local.get(id);
+        let remote_session = remote.get(id);
+        let local_action = session_action(local_session, merged);
+        let remote_action = session_action(remote_session, merged);
+        if local_action == FileAction::Unchanged && remote_action == FileAction::Unchanged {
+            continue;
+        }
+        let resolution = if local_session.is_some_and(|value| value.semantically_equal(merged))
+            && remote_session.is_some_and(|value| value.semantically_equal(merged))
+        {
+            "identical"
+        } else if local_session.is_some_and(|value| value.semantically_equal(merged)) {
+            "local"
+        } else if remote_session.is_some_and(|value| value.semantically_equal(merged)) {
+            "remote"
+        } else if local_session.is_none() && remote_session.is_none() {
+            "generated"
+        } else {
+            "merged"
+        };
+        changes.push(FileChange {
+            resource: "sessions".into(),
+            path: format!("sessions/{id}.json"),
+            display_path: id.clone(),
+            local: local_action,
+            remote: remote_action,
+            resolution: resolution.into(),
+            local_sha256: local_session
+                .map(SessionExport::canonical_hash)
+                .transpose()?,
+            remote_sha256: remote_session
+                .map(SessionExport::canonical_hash)
+                .transpose()?,
+            result_sha256: Some(merged.canonical_hash()?),
+        });
+    }
+    Ok(changes)
 }
 
 fn lsof_command() -> &'static str {
@@ -429,8 +516,12 @@ fn import_local(path: &Path) -> Result<()> {
 }
 
 fn import_remote(bytes: &[u8], transport: &SshTransport) -> Result<()> {
-    transport.ssh_with_input("opencode import /dev/stdin", bytes)?;
+    transport.ssh_with_input(remote_import_script(), bytes)?;
     Ok(())
+}
+
+fn remote_import_script() -> &'static str {
+    "set -eu; umask 077; p=$(mktemp \"${TMPDIR:-/tmp}/agent-sync-opencode-import.XXXXXX\"); trap 'rm -f \"$p\"' EXIT; cat > \"$p\"; opencode import \"$p\""
 }
 
 fn decorate_paths(
@@ -519,7 +610,7 @@ impl Adapter for OpenCodeAdapter {
             .push("OpenCode has no separate memory resource; credentials are excluded".into());
         let result = merge_exports(&local_sessions, &remote_sessions, &mut report)?;
         write_exports(&stage, &result)?;
-        report.files = planned_file_changes(&local_snapshot, &remote_snapshot, &stage, |_| false)?;
+        report.files = planned_session_changes(&local_sessions, &remote_sessions, &result)?;
         decorate_paths(&mut report.files, &result);
         if options.apply {
             let remote_writers: OpenCodeWritersResult =
@@ -686,6 +777,79 @@ mod tests {
             id,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn remote_import_uses_a_regular_private_temp_file() {
+        let script = remote_import_script();
+        assert!(script.contains("umask 077"));
+        assert!(script.contains("mktemp"));
+        assert!(script.contains("trap 'rm -f"));
+        assert!(script.contains("cat > \"$p\""));
+        assert!(script.contains("opencode import \"$p\""));
+        assert!(!script.contains("/dev/stdin"));
+    }
+
+    #[test]
+    fn canonical_hash_ignores_json_object_key_order() {
+        let left = SessionExport::parse(
+            br#"{"info":{"id":"ses_test","title":"test"},"messages":[]}"#,
+            "ses_test",
+        )
+        .unwrap();
+        let right = SessionExport::parse(
+            br#"{"messages":[],"info":{"title":"test","id":"ses_test"}}"#,
+            "ses_test",
+        )
+        .unwrap();
+        assert_eq!(
+            left.canonical_hash().unwrap(),
+            right.canonical_hash().unwrap()
+        );
+        assert!(left.semantically_equal(&right));
+
+        let mut report = PlanReport::default();
+        let merged = merge_exports(
+            &BTreeMap::from([("ses_test".into(), left)]),
+            &BTreeMap::from([("ses_test".into(), right)]),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(report.identical, 1);
+        assert_eq!(report.advances, 0);
+    }
+
+    #[test]
+    fn prefix_comparison_ignores_message_object_key_order() {
+        let left = session("ses_test", &["msg_a"]);
+        let mut right = left.clone();
+        let message = right.value["messages"][0].as_object_mut().unwrap();
+        let info = message.remove("info").unwrap();
+        message.insert("info".into(), info);
+
+        assert!(is_prefix(&left, &right));
+        assert!(is_prefix(&right, &left));
+        assert_eq!(common_prefix(&left, &right), 1);
+    }
+
+    #[test]
+    fn imported_machine_metadata_does_not_create_perpetual_updates() {
+        let local = session("ses_test", &["msg_a"]);
+        let mut remote = local.clone();
+        remote.value["info"]["directory"] = Value::String("/remote/project".into());
+        remote.value["info"]["path"] = Value::String("remote/project".into());
+        remote.value["info"]["projectID"] = Value::String("global".into());
+        remote.value["info"]["cost"] = serde_json::json!(0.10000000000000002);
+
+        assert!(local.semantically_equal(&remote));
+        let changes = planned_session_changes(
+            &BTreeMap::from([("ses_test".into(), local)]),
+            &BTreeMap::from([("ses_test".into(), remote)]),
+            &BTreeMap::from([("ses_test".into(), session("ses_test", &["msg_a"]))]),
+        )
+        .unwrap();
+        assert!(changes.is_empty());
     }
 
     #[test]

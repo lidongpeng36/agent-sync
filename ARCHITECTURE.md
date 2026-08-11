@@ -10,7 +10,8 @@ The binary has four layers:
    backups, mtime normalization, and SQLite maintenance in Rust. The protocol
    deliberately has no arbitrary-command request.
 3. The core owns manifests, path validation, private temporary storage, CLI
-   output, confirmation, and common safety invariants.
+   output, confirmation, the shared local/remote/editor conflict interaction,
+   and common safety invariants.
 4. Built-in `AgentAdapter` implementations own agent formats, merge policy,
    writer protection, backup selection, and post-apply repair.
 
@@ -21,12 +22,17 @@ messages rather than interpolated into remote shell programs. OpenSSH remains
 the authentication and transport boundary so existing host aliases, jump
 hosts, agents, and host-key policy remain authoritative.
 
-An adapter implements `doctor`, `prepare`, optional interactive resolution,
-and `apply`. `prepare` must be read-only and produce a complete staged tree,
-blockers, and a file-granularity plan. Human and JSON output render that plan;
-diff output compares each side with the same staged tree. `apply` must reject a
-stale plan, back up before mutation, install the stage, and verify a fresh
-remote readback.
+An adapter implements `doctor`, `prepare`, conflict mapping and validation, and
+`apply`. The local/remote/editor prompt, editor selection, private edit files,
+conflict markers, and marker validation are shared core behavior; adapters only
+validate agent-specific edited formats and update their staged metadata.
+`prepare` must be read-only and produce a complete staged tree, blockers, and a
+file-granularity plan. Human and JSON output render that plan; diff output
+compares each side with the same staged tree. `apply` must reject a stale plan,
+back up before mutation, install the stage, and verify a fresh remote readback.
+Codex active-session exclusion also defers its aggregate history/index files and
+catalog/state repair, preventing an excluded live rollout from being changed
+through derived metadata while unrelated resources continue to synchronize.
 
 The trait is an internal Rust extension point, not a stable dynamic-plugin ABI.
 Adding another agent means adding a module with fixtures that prove validation,

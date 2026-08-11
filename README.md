@@ -62,10 +62,19 @@ confirms the staged plan but does not change its conflict strategy.
 The default resource set is `sessions` plus `memory`; select one with
 `--only sessions` or `--only memory`. Add `--format json` for machine-readable
 plans. Safe unions, linear advances, Markdown block merges, and deterministic
-session forks are always automatic. Irreconcilable Claude conflicts use the
-configured `ask` strategy by default; override it per invocation with `-s ask`,
-`-s local`, or `-s remote` (the long form is `--conflict-strategy`). The legacy
-value `merge` remains accepted as an alias for `ask`.
+session forks are always automatic. Irreconcilable conflicts use the configured
+`ask` strategy by default; override it per invocation with `-s ask`, `-s local`,
+or `-s remote` (the long form is `--conflict-strategy`). The legacy value
+`merge` remains accepted as an alias for `ask`. In interactive `ask` applies,
+Codex rollout/memory conflicts and Claude memory conflicts offer local, remote,
+or `$EDITOR`. A conflict strategy does not override active-writer safety rules.
+
+For Codex, sessions with an active writer are reported as warnings and excluded
+from that run; other rollouts and memory continue to synchronize. While any
+Codex session is active, `history.jsonl`, `session_index.jsonl`, catalog scans,
+and state timestamp repair are deferred so the excluded session cannot be
+modified indirectly. A newly active session discovered after preview makes the
+plan stale and requires a rerun so it can be excluded safely.
 
 The `sync`, `doctor`, and `adapters` commands have the aliases `s`, `d`, and
 `a`. Common options also have short forms: `-o` (`--only`), `-a` (`--apply`),
@@ -163,8 +172,8 @@ converge. Conflict strategy does not apply to OpenCode sessions.
 - Safe same-path changes are merged automatically. Ambiguous memory blocks
   follow the explicit conflict strategy, while Claude session forks are always
   preserved as separate UUIDs.
-- Active writers are detected before writes; Codex coordination locks are held
-  through the file transaction.
+- Active writers are detected before writes; active Codex sessions are excluded,
+  and Codex coordination locks are held through the remaining file transaction.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
 - OpenCode backups remain on their originating machine, and account,
