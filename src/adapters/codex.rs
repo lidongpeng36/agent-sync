@@ -1,9 +1,9 @@
 use super::{Adapter, Prepared};
 use crate::core::{
     Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PlanReport, ResourceSelection,
-    SyncOptions, bytes_sha256, cache_path, choose_interactively, edit_conflict_documents,
-    file_lock_is_held, fingerprint, manifest, planned_file_changes, print_planned_diff,
-    private_dir, stamp,
+    SyncOptions, bytes_sha256, choose_interactively, complete_remote_view, edit_conflict_documents,
+    file_lock_is_held, inventory, inventory_cached, inventory_transfer_paths, manifest,
+    planned_file_changes, print_planned_diff, private_dir, stamp,
 };
 use crate::remote::{Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
@@ -51,7 +51,7 @@ pub struct CodexPrepared {
     pub report: PlanReport,
     temp: TempDir,
     stage: PathBuf,
-    remote_snapshot: PathBuf,
+    remote_view: PathBuf,
     local_fingerprint: String,
     remote_fingerprint: String,
     resources: ResourceSelection,
@@ -59,6 +59,9 @@ pub struct CodexPrepared {
     active: BTreeSet<String>,
     conflicts: Vec<CodexConflict>,
     local_root: PathBuf,
+    state_root: PathBuf,
+    local_node_id: String,
+    remote_node_id: String,
 }
 
 pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
@@ -77,7 +80,7 @@ pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
             blocker.resource, blocker.path, blocker.reason
         );
     }
-    print_planned_diff(local, &prepared.remote_snapshot, &prepared.stage, |path| {
+    print_planned_diff(local, &prepared.remote_view, &prepared.stage, |path| {
         excluded(path, prepared.resources) || active_excluded_path(path, &prepared.active)
     })
 }
@@ -109,11 +112,38 @@ impl Adapter for CodexAdapter {
         let temp = tempfile::Builder::new()
             .prefix("agent-sync-codex-")
             .tempdir()?;
-        let remote = cache_path(options, "codex", &transport.host)?;
-        pull_codex(transport, remote_root, &remote, options.resources)?;
+        let scan_guard = transport.remote_guard(&RemoteRequest::HoldSyncLock {
+            agent: "codex".to_owned(),
+            resources: options.resources,
+        })?;
+        let remote = temp.path().join("remote-view");
+        private_dir(&remote)?;
         let stage = temp.path().join("stage");
         private_dir(&stage)?;
         let active = active_writer_ids(local, remote_root, transport)?;
+        let exclude = |p: &Path| excluded(p, options.resources) || active_excluded_path(p, &active);
+        let state_root = crate::state::state_root(options)?;
+        let local_node_id = crate::state::node_id(&state_root)?;
+        let remote_node_id = transport.remote_node_id()?;
+        let previous =
+            crate::state::load(&state_root, "codex", &transport.host, options.resources)?;
+        let (local_inventory, reused) = inventory_cached(
+            local,
+            exclude,
+            previous.as_ref().map(|value| &value.inventory),
+        )?;
+        let remote_inventory: crate::core::Inventory =
+            transport.remote_request(&RemoteRequest::Inventory {
+                root: remote_root.to_owned(),
+                agent: "codex".to_owned(),
+                resources: options.resources,
+                excluded_ids: active.iter().cloned().collect(),
+                peer_id: local_node_id.clone(),
+            })?;
+        let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
+        transport.pull_files(remote_root, &remote, &transfer)?;
+        complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
+        drop(scan_guard);
         let (mut report, metadata, conflicts) = build_stage(
             local,
             &remote,
@@ -123,6 +153,20 @@ impl Adapter for CodexAdapter {
             &transport.host,
             options.conflict_strategy,
         )?;
+        let transferred_bytes = remote_inventory
+            .entries
+            .iter()
+            .filter(|entry| transfer.contains(&entry.path))
+            .map(|entry| entry.size)
+            .sum::<u64>();
+        report.notes.push(format!(
+            "manifest: hashes reused local={reused}/{}, remote={}/{}; objects fetched={}/{} uncompressed bytes",
+            local_inventory.entries.len(),
+            remote_inventory.reused_entries,
+            remote_inventory.entries.len(),
+            transfer.len(),
+            transferred_bytes
+        ));
         report.files = planned_file_changes(local, &remote, &stage, |path| {
             excluded(path, options.resources) || active_excluded_path(path, &active)
         })?;
@@ -135,20 +179,22 @@ impl Adapter for CodexAdapter {
                 }
             }
         }
-        let exclude = |p: &Path| excluded(p, options.resources) || active_excluded_path(p, &active);
-        let remote_fingerprint = fingerprint(&remote, exclude)?;
+        let remote_fingerprint = remote_inventory.generation;
         Ok(Prepared::Codex(CodexPrepared {
             report,
             temp,
             stage,
-            remote_snapshot: remote,
-            local_fingerprint: fingerprint(local, exclude)?,
+            remote_view: remote,
+            local_fingerprint: local_inventory.generation,
             remote_fingerprint,
             resources: options.resources,
             metadata,
             active,
             conflicts,
             local_root: local.to_path_buf(),
+            state_root,
+            local_node_id,
+            remote_node_id,
         }))
     }
 
@@ -191,7 +237,7 @@ impl Adapter for CodexAdapter {
             .retain(|blocker| !blocker.reason.contains("requires a choice"));
         value.report.files = planned_file_changes(
             &value.local_root,
-            &value.remote_snapshot,
+            &value.remote_view,
             &value.stage,
             |path| excluded(path, value.resources) || active_excluded_path(path, &value.active),
         )?;
@@ -217,6 +263,13 @@ impl Adapter for CodexAdapter {
         };
         let exclude =
             |p: &Path| excluded(p, value.resources) || active_excluded_path(p, &value.active);
+        let _sync_guards = transport.sync_guards(
+            &value.state_root,
+            &value.local_node_id,
+            &value.remote_node_id,
+            "codex",
+            value.resources,
+        )?;
         let _guard = if value.resources.sessions() {
             Some(CodexGuards::acquire(local, remote_root, transport)?)
         } else {
@@ -235,16 +288,18 @@ impl Adapter for CodexAdapter {
                 );
             }
         }
-        if fingerprint(local, exclude)? != value.local_fingerprint {
+        if inventory(local, exclude)?.generation != value.local_fingerprint {
             bail!("local Codex data changed after preview");
         }
-        pull_codex(
-            transport,
-            remote_root,
-            &value.remote_snapshot,
-            value.resources,
-        )?;
-        if fingerprint(&value.remote_snapshot, exclude)? != value.remote_fingerprint {
+        let current_remote: crate::core::Inventory =
+            transport.remote_request(&RemoteRequest::Inventory {
+                root: remote_root.to_owned(),
+                agent: "codex".to_owned(),
+                resources: value.resources,
+                excluded_ids: value.active.iter().cloned().collect(),
+                peer_id: value.local_node_id.clone(),
+            })?;
+        if current_remote.generation != value.remote_fingerprint {
             bail!("remote Codex data changed after preview");
         }
         if value.resources.sessions() && value.active.is_empty() {
@@ -260,19 +315,20 @@ impl Adapter for CodexAdapter {
         }
         install_local(&value.stage, local, &transport.rsync)?;
         transport.push(&value.stage, remote_root)?;
-        pull_codex(
-            transport,
-            remote_root,
-            &value.remote_snapshot,
-            value.resources,
-        )?;
         verify_selected(&value.stage, local, value.resources, &value.active, "local")?;
-        verify_selected(
+        let verified_remote: crate::core::Inventory =
+            transport.remote_request(&RemoteRequest::Inventory {
+                root: remote_root.to_owned(),
+                agent: "codex".to_owned(),
+                resources: value.resources,
+                excluded_ids: value.active.iter().cloned().collect(),
+                peer_id: value.local_node_id.clone(),
+            })?;
+        verify_remote_inventory(
             &value.stage,
-            &value.remote_snapshot,
+            &verified_remote,
             value.resources,
             &value.active,
-            "remote",
         )?;
         drop(_guard);
         if value.resources.sessions() && value.active.is_empty() {
@@ -296,6 +352,25 @@ impl Adapter for CodexAdapter {
                 value.active.iter().cloned().collect::<Vec<_>>().join(",")
             );
         }
+        let final_inventory = inventory(local, exclude)?;
+        let local_checkpoint = crate::state::Checkpoint::new(
+            "codex",
+            value.resources,
+            &transport.host,
+            final_inventory,
+        );
+        let mut remote_checkpoint = local_checkpoint.clone();
+        remote_checkpoint.peer = value.local_node_id;
+        remote_checkpoint.inventory = verified_remote;
+        remote_checkpoint.result_content_hash =
+            crate::state::content_hash(&remote_checkpoint.inventory);
+        if remote_checkpoint.result_content_hash != local_checkpoint.result_content_hash {
+            bail!("cannot checkpoint divergent Codex results");
+        }
+        let _: Value = transport.remote_request(&RemoteRequest::SaveCheckpoint {
+            checkpoint: remote_checkpoint,
+        })?;
+        crate::state::save(&value.state_root, &local_checkpoint)?;
         println!(
             "complete: Codex synchronized and verified; backups: local={}, remote={}:{}",
             local_backup.display(),
@@ -372,26 +447,6 @@ fn stage_codex_choice(
     Ok(())
 }
 
-fn pull_codex(t: &SshTransport, root: &str, dest: &Path, r: ResourceSelection) -> Result<()> {
-    let mut f = vec![
-        "--exclude=/sync-backups/***",
-        "--exclude=/memories/.git/***",
-        "--exclude=/memories/.omx/***",
-    ];
-    if r.sessions() {
-        f.extend([
-            "--include=/sessions/***",
-            "--include=/archived_sessions/***",
-            "--include=/history.jsonl",
-            "--include=/session_index.jsonl",
-        ]);
-    }
-    if r.memory() {
-        f.push("--include=/memories/***");
-    }
-    f.push("--exclude=*");
-    t.pull(root, dest, &f)
-}
 pub(crate) fn archive_excluded(p: &Path, r: ResourceSelection) -> bool {
     let n = p
         .components()
@@ -1027,6 +1082,21 @@ fn verify_selected(
     let b = manifest(actual, exclude)?;
     if a != b {
         bail!("{side} final file set or content differs from the staged manifest");
+    }
+    Ok(())
+}
+
+fn verify_remote_inventory(
+    stage: &Path,
+    actual: &crate::core::Inventory,
+    resources: ResourceSelection,
+    active: &BTreeSet<String>,
+) -> Result<()> {
+    let expected = inventory(stage, |path| {
+        excluded(path, resources) || active_excluded_path(path, active)
+    })?;
+    if expected.content_manifest() != actual.content_manifest() {
+        bail!("remote final file set or content differs from the staged manifest");
     }
     Ok(())
 }

@@ -42,6 +42,9 @@ pub struct OpenCodePrepared {
     stage: PathBuf,
     local_fingerprint: BTreeMap<String, String>,
     remote_fingerprint: BTreeMap<String, String>,
+    state_root: PathBuf,
+    local_node_id: String,
+    remote_node_id: String,
 }
 
 pub(super) fn print_diff(prepared: &OpenCodePrepared, _local: &Path) -> Result<()> {
@@ -124,9 +127,7 @@ impl SessionExport {
     }
 
     fn canonical_hash(&self) -> Result<String> {
-        Ok(bytes_sha256(&serde_json::to_vec(&semantic_json(
-            &self.value,
-        ))?))
+        canonical_hash_value(&self.value)
     }
 
     fn semantically_equal(&self, other: &Self) -> bool {
@@ -179,6 +180,10 @@ fn semantic_json(value: &Value) -> Value {
     normalized
 }
 
+pub(crate) fn canonical_hash_value(value: &Value) -> Result<String> {
+    Ok(bytes_sha256(&serde_json::to_vec(&semantic_json(value))?))
+}
+
 fn valid_session_id(id: &str) -> bool {
     id.starts_with("ses_")
         && id.chars().all(|character| {
@@ -228,22 +233,15 @@ fn export_remote(
     ids: &[String],
     transport: &SshTransport,
 ) -> Result<BTreeMap<String, SessionExport>> {
-    let mut sessions = BTreeMap::new();
-    for id in ids {
-        if !valid_session_id(id) {
-            bail!("unsafe remote OpenCode session id: {id:?}");
-        }
-        let script = format!(
-            "set -eu; umask 077; p=$(mktemp \"${{TMPDIR:-/tmp}}/agent-sync-opencode.XXXXXX\"); trap 'rm -f \"$p\"' EXIT; opencode export {id} > \"$p\"; cat \"$p\""
-        );
-        let output = transport.ssh(&script)?;
-        sessions.insert(
-            id.clone(),
-            SessionExport::parse(&output.stdout, id)
-                .with_context(|| format!("decode remote OpenCode session {id}"))?,
-        );
-    }
-    Ok(sessions)
+    let exports: BTreeMap<String, Value> =
+        transport.remote_request(&RemoteRequest::OpenCodeExports { ids: ids.to_vec() })?;
+    exports
+        .into_iter()
+        .map(|(id, value)| {
+            let bytes = serde_json::to_vec(&value)?;
+            Ok((id.clone(), SessionExport::parse(&bytes, &id)?))
+        })
+        .collect()
 }
 
 fn is_prefix(shorter: &SessionExport, longer: &SessionExport) -> bool {
@@ -674,13 +672,37 @@ impl Adapter for OpenCodeAdapter {
         let temp = tempfile::Builder::new()
             .prefix("agent-sync-opencode-")
             .tempdir()?;
+        let state_root = crate::state::state_root(options)?;
+        let local_node_id = crate::state::node_id(&state_root)?;
+        let remote_node_id = transport.remote_node_id()?;
+        let _scan_guard = transport.remote_guard(&RemoteRequest::HoldSyncLock {
+            agent: "opencode".to_owned(),
+            resources: options.resources,
+        })?;
         let local_ids = local_session_ids(local)?;
-        let remote_ids: Vec<String> =
-            transport.remote_request(&RemoteRequest::OpenCodeSessionIds {
+        let local_sessions = export_local(&local_ids)?;
+        let local_fingerprint = fingerprint(&local_sessions)?;
+        let remote_fingerprint: BTreeMap<String, String> =
+            transport.remote_request(&RemoteRequest::OpenCodeInventory {
                 root: remote.to_owned(),
             })?;
-        let local_sessions = export_local(&local_ids)?;
-        let remote_sessions = export_remote(&remote_ids, transport)?;
+        let changed_remote = remote_fingerprint
+            .iter()
+            .filter(|(id, hash)| local_fingerprint.get(*id) != Some(*hash))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut remote_sessions = export_remote(&changed_remote, transport)?;
+        for (id, hash) in &remote_fingerprint {
+            if local_fingerprint.get(id) == Some(hash) {
+                remote_sessions.insert(
+                    id.clone(),
+                    local_sessions
+                        .get(id)
+                        .context("matching local OpenCode session disappeared")?
+                        .clone(),
+                );
+            }
+        }
         let local_snapshot = temp.path().join("local");
         let remote_snapshot = temp.path().join("remote");
         let stage = temp.path().join("stage");
@@ -695,6 +717,11 @@ impl Adapter for OpenCodeAdapter {
         report
             .notes
             .push("OpenCode has no separate memory resource; credentials are excluded".into());
+        report.notes.push(format!(
+            "manifest: remote sessions exported={}/{}",
+            changed_remote.len(),
+            remote_fingerprint.len()
+        ));
         let result = merge_exports(&local_sessions, &remote_sessions, &mut report)?;
         write_exports(&stage, &result)?;
         report.files = planned_session_changes(&local_sessions, &remote_sessions, &result)?;
@@ -718,8 +745,11 @@ impl Adapter for OpenCodeAdapter {
             local_snapshot,
             remote_snapshot,
             stage,
-            local_fingerprint: fingerprint(&local_sessions)?,
-            remote_fingerprint: fingerprint(&remote_sessions)?,
+            local_fingerprint,
+            remote_fingerprint,
+            state_root,
+            local_node_id,
+            remote_node_id,
         }))
     }
 
@@ -738,16 +768,22 @@ impl Adapter for OpenCodeAdapter {
         let Prepared::OpenCode(value) = prepared else {
             bail!("adapter/prepared plan mismatch");
         };
+        let _sync_guards = transport.sync_guards(
+            &value.state_root,
+            &value.local_node_id,
+            &value.remote_node_id,
+            "opencode",
+            options.resources,
+        )?;
         let current_local = export_local(&local_session_ids(local)?)?;
-        let current_remote_ids: Vec<String> =
-            transport.remote_request(&RemoteRequest::OpenCodeSessionIds {
+        let current_remote: BTreeMap<String, String> =
+            transport.remote_request(&RemoteRequest::OpenCodeInventory {
                 root: remote.to_owned(),
             })?;
-        let current_remote = export_remote(&current_remote_ids, transport)?;
         if fingerprint(&current_local)? != value.local_fingerprint {
             bail!("local OpenCode sessions changed after preview");
         }
-        if fingerprint(&current_remote)? != value.remote_fingerprint {
+        if current_remote != value.remote_fingerprint {
             bail!("remote OpenCode sessions changed after preview");
         }
         let remote_writers: OpenCodeWritersResult =
@@ -801,21 +837,24 @@ impl Adapter for OpenCodeAdapter {
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         let verified_local = export_local(&local_session_ids(local)?)?;
-        let verified_remote_ids: Vec<String> =
-            transport.remote_request(&RemoteRequest::OpenCodeSessionIds {
+        let verified_remote: BTreeMap<String, String> =
+            transport.remote_request(&RemoteRequest::OpenCodeInventory {
                 root: remote.to_owned(),
             })?;
-        let verified_remote = export_remote(&verified_remote_ids, transport)?;
         for (id, expected_session) in expected {
-            for (side, actual) in [
-                ("local", verified_local.get(&id)),
-                ("remote", verified_remote.get(&id)),
-            ] {
-                let actual =
-                    actual.with_context(|| format!("{side} omitted OpenCode session {id}"))?;
-                if actual.canonical_hash()? != expected_session.canonical_hash()? {
-                    bail!("{side} OpenCode session differs after import: {id}");
-                }
+            let expected_hash = expected_session.canonical_hash()?;
+            let local_hash = verified_local
+                .get(&id)
+                .with_context(|| format!("local omitted OpenCode session {id}"))?
+                .canonical_hash()?;
+            if local_hash != expected_hash {
+                bail!("local OpenCode session differs after import: {id}");
+            }
+            let remote_hash = verified_remote
+                .get(&id)
+                .with_context(|| format!("remote omitted OpenCode session {id}"))?;
+            if remote_hash != &expected_hash {
+                bail!("remote OpenCode session differs after import: {id}");
             }
         }
         println!(

@@ -1,4 +1,5 @@
-use crate::core::file_lock_is_held;
+use crate::core::{ResourceSelection, file_lock_is_held, inventory_cached};
+use crate::state::Checkpoint;
 use anyhow::{Context, Result, bail};
 use filetime::FileTime;
 use fs2::FileExt;
@@ -10,18 +11,34 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    NodeId,
     Doctor {
         root: String,
         agent: String,
+    },
+    Inventory {
+        root: String,
+        agent: String,
+        resources: ResourceSelection,
+        #[serde(default)]
+        excluded_ids: Vec<String>,
+        peer_id: String,
+    },
+    SaveCheckpoint {
+        checkpoint: Checkpoint,
+    },
+    HoldSyncLock {
+        agent: String,
+        resources: ResourceSelection,
     },
     ClaudeMtimes {
         root: String,
@@ -37,8 +54,11 @@ pub enum Request {
     CodexActiveWriters {
         root: String,
     },
-    OpenCodeSessionIds {
+    OpenCodeInventory {
         root: String,
+    },
+    OpenCodeExports {
+        ids: Vec<String>,
     },
     OpenCodeWriters {
         root: String,
@@ -119,7 +139,10 @@ pub fn serve(protocol: u32) -> Result<()> {
         bail!("missing remote request");
     }
     let request: Request = serde_json::from_str(&line).context("decode remote request")?;
-    let hold = matches!(request, Request::HoldCoordinationLock { .. });
+    let hold = matches!(
+        request,
+        Request::HoldCoordinationLock { .. } | Request::HoldSyncLock { .. }
+    );
     let result = dispatch(request);
     let response = match result {
         Ok(value) => Response::success(value)?,
@@ -141,6 +164,9 @@ fn dispatch(request: Request) -> Result<Value> {
             "protocol": PROTOCOL_VERSION,
             "version": env!("CARGO_PKG_VERSION"),
             "executable_sha256": executable_sha256()?,
+        })),
+        Request::NodeId => Ok(serde_json::json!({
+            "node_id": crate::state::node_id(&crate::state::default_state_root()?)?,
         })),
         Request::Doctor { root, agent } => {
             let root = expand_root(&root)?;
@@ -181,6 +207,46 @@ fn dispatch(request: Request) -> Result<Value> {
             }
             Ok(serde_json::json!({ "ready": true }))
         }
+        Request::Inventory {
+            root,
+            agent,
+            resources,
+            excluded_ids,
+            peer_id,
+        } => {
+            let root = expand_root(&root)?;
+            let state_root = crate::state::default_state_root()?;
+            let previous = crate::state::load(&state_root, &agent, &peer_id, resources)?;
+            let (value, _) = inventory_cached(
+                &root,
+                |path| {
+                    inventory_excluded(&agent, resources, path)
+                        || excluded_ids
+                            .iter()
+                            .any(|id| path.to_string_lossy().contains(id))
+                        || (!excluded_ids.is_empty()
+                            && matches!(
+                                path.to_string_lossy().as_ref(),
+                                "history.jsonl" | "session_index.jsonl"
+                            ))
+                },
+                previous.as_ref().map(|value| &value.inventory),
+            )?;
+            Ok(serde_json::to_value(value)?)
+        }
+        Request::SaveCheckpoint { checkpoint } => {
+            crate::state::save(&crate::state::default_state_root()?, &checkpoint)?;
+            Ok(serde_json::json!({ "saved": true }))
+        }
+        Request::HoldSyncLock { agent, resources } => {
+            let guard = crate::state::acquire_sync_lock(
+                &crate::state::default_state_root()?,
+                &agent,
+                resources,
+            )?;
+            std::mem::forget(guard);
+            Ok(serde_json::json!({ "locked": true }))
+        }
         Request::ClaudeMtimes {
             root,
             include_memory,
@@ -198,9 +264,10 @@ fn dispatch(request: Request) -> Result<Value> {
         Request::CodexActiveWriters { root } => Ok(serde_json::to_value(codex_active_writers(
             &expand_root(&root)?,
         )?)?),
-        Request::OpenCodeSessionIds { root } => Ok(serde_json::to_value(opencode_session_ids(
+        Request::OpenCodeInventory { root } => Ok(serde_json::to_value(opencode_inventory(
             &expand_root(&root)?,
         )?)?),
+        Request::OpenCodeExports { ids } => Ok(serde_json::to_value(opencode_exports(&ids)?)?),
         Request::OpenCodeWriters { root } => Ok(serde_json::json!({
             "active": sqlite_writers(&expand_root(&root)?.join("opencode.db"))?,
         })),
@@ -247,6 +314,53 @@ fn dispatch(request: Request) -> Result<Value> {
                 }))
             }
         }
+    }
+}
+
+fn inventory_excluded(agent: &str, resources: ResourceSelection, path: &Path) -> bool {
+    let first = path.components().next().map(|part| part.as_os_str());
+    match agent {
+        "codex" => {
+            let memory = first == Some("memories".as_ref());
+            let sessions = matches!(
+                first,
+                Some(value)
+                    if value == "sessions"
+                        || value == "archived_sessions"
+                        || value == "history.jsonl"
+                        || value == "session_index.jsonl"
+            );
+            let private_memory = memory
+                && path
+                    .components()
+                    .skip(1)
+                    .any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".omx");
+            (!resources.memory() && memory)
+                || (!resources.sessions() && sessions)
+                || (!memory && !sessions)
+                || private_memory
+                || path.to_string_lossy().contains("sync-backups")
+        }
+        "claude" => {
+            let parts = path.components().collect::<Vec<_>>();
+            if first != Some("projects".as_ref()) {
+                return true;
+            }
+            let memory = parts.get(2).map(|part| part.as_os_str()) == Some("memory".as_ref());
+            let managed_memory = memory
+                && parts.len() == 4
+                && Path::new(parts[3].as_os_str())
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("md");
+            if memory && !managed_memory {
+                return true;
+            }
+            (!resources.memory() && memory)
+                || (!resources.sessions() && !memory)
+                || path.to_string_lossy().contains("sync-backups")
+        }
+        _ => true,
     }
 }
 
@@ -405,6 +519,47 @@ fn opencode_session_ids(root: &Path) -> Result<Vec<String>> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(ids)
+}
+
+fn valid_opencode_session_id(id: &str) -> bool {
+    id.starts_with("ses_")
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+}
+
+fn opencode_exports(ids: &[String]) -> Result<BTreeMap<String, Value>> {
+    let mut exports = BTreeMap::new();
+    for id in ids {
+        if !valid_opencode_session_id(id) {
+            bail!("unsafe OpenCode session id: {id:?}");
+        }
+        let output_file = tempfile::NamedTempFile::new()?;
+        let output = Command::new("opencode")
+            .args(["export", id])
+            .stdout(Stdio::from(output_file.reopen()?))
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "remote OpenCode export failed for {id}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let value: Value = serde_json::from_slice(&fs::read(output_file.path())?)
+            .with_context(|| format!("decode remote OpenCode session {id}"))?;
+        if value.pointer("/info/id").and_then(Value::as_str) != Some(id) {
+            bail!("remote OpenCode export id mismatch for {id}");
+        }
+        exports.insert(id.clone(), value);
+    }
+    Ok(exports)
+}
+
+fn opencode_inventory(root: &Path) -> Result<BTreeMap<String, String>> {
+    opencode_exports(&opencode_session_ids(root)?)?
+        .into_iter()
+        .map(|(id, value)| Ok((id, crate::adapters::opencode::canonical_hash_value(&value)?)))
+        .collect()
 }
 
 fn sqlite_writers(database: &Path) -> Result<bool> {

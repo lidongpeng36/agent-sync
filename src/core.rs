@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
@@ -22,7 +23,8 @@ pub enum OutputFormat {
     Diff,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ResourceSelection {
     All,
     Sessions,
@@ -195,6 +197,38 @@ pub struct SyncOptions {
     pub cache_dir: Option<PathBuf>,
     pub resources: ResourceSelection,
     pub conflict_strategy: ConflictStrategy,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InventoryEntry {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+    pub modified_ns: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Inventory {
+    pub generation: String,
+    pub entries: Vec<InventoryEntry>,
+    #[serde(default)]
+    pub reused_entries: usize,
+}
+
+impl Inventory {
+    pub fn by_path(&self) -> BTreeMap<&str, &InventoryEntry> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect()
+    }
+
+    pub fn content_manifest(&self) -> BTreeMap<&str, &str> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.sha256.as_str()))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -892,45 +926,144 @@ pub fn manifest(root: &Path, exclude: impl Fn(&Path) -> bool) -> Result<BTreeMap
     Ok(result)
 }
 
-pub fn fingerprint(root: &Path, exclude: impl Fn(&Path) -> bool) -> Result<String> {
-    let mut digest = Sha256::new();
-    for (path, hash) in manifest(root, exclude)? {
-        digest.update(path);
-        digest.update([0]);
-        digest.update(hash);
-        digest.update([0]);
+pub fn inventory(root: &Path, exclude: impl Fn(&Path) -> bool) -> Result<Inventory> {
+    inventory_cached(root, exclude, None).map(|(inventory, _)| inventory)
+}
+
+pub fn inventory_cached(
+    root: &Path,
+    exclude: impl Fn(&Path) -> bool,
+    previous: Option<&Inventory>,
+) -> Result<(Inventory, usize)> {
+    let mut entries = Vec::new();
+    let previous = previous.map(Inventory::by_path).unwrap_or_default();
+    let mut reused = 0;
+    if root.exists() {
+        for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root)?;
+            if relative.as_os_str().is_empty() || exclude(relative) {
+                continue;
+            }
+            if entry.file_type().is_symlink() {
+                bail!("symlink is not allowed: {}", path.display());
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            safe_relative(relative)?;
+            let metadata = entry.metadata()?;
+            let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
+            let relative = relative.to_string_lossy().into_owned();
+            let size = metadata.len();
+            let modified_ns = modified.as_nanos() as i64;
+            let sha256 = if let Some(previous) = previous
+                .get(relative.as_str())
+                .filter(|entry| entry.size == size && entry.modified_ns == modified_ns)
+            {
+                reused += 1;
+                previous.sha256.clone()
+            } else {
+                sha256(path)?
+            };
+            entries.push(InventoryEntry {
+                path: relative,
+                sha256,
+                size,
+                modified_ns,
+            });
+        }
     }
-    Ok(hex::encode(digest.finalize()))
+    let mut digest = Sha256::new();
+    for entry in &entries {
+        digest.update(&entry.path);
+        digest.update([0]);
+        digest.update(&entry.sha256);
+        digest.update([0]);
+        digest.update(entry.size.to_le_bytes());
+        digest.update(entry.modified_ns.to_le_bytes());
+    }
+    Ok((
+        Inventory {
+            generation: hex::encode(digest.finalize()),
+            entries,
+            reused_entries: reused,
+        },
+        reused,
+    ))
+}
+
+pub fn inventory_transfer_paths(local: &Inventory, remote: &Inventory) -> Vec<String> {
+    let local_hashes = local
+        .entries
+        .iter()
+        .map(|entry| entry.sha256.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    remote
+        .entries
+        .iter()
+        .filter(|entry| !local_hashes.contains(entry.sha256.as_str()))
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+pub fn complete_remote_view(
+    local_root: &Path,
+    local: &Inventory,
+    remote_view: &Path,
+    remote: &Inventory,
+) -> Result<()> {
+    let mut local_by_hash = BTreeMap::new();
+    for entry in &local.entries {
+        local_by_hash.entry(entry.sha256.as_str()).or_insert(entry);
+    }
+    for entry in &remote.entries {
+        let destination = remote_view.join(&entry.path);
+        if !destination.exists() {
+            let source_entry = local_by_hash
+                .get(entry.sha256.as_str())
+                .with_context(|| format!("remote object was not transferred: {}", entry.path))?;
+            let source = local_root.join(&source_entry.path);
+            private_dir(
+                destination
+                    .parent()
+                    .context("inventory path has no parent")?,
+            )?;
+            if source_entry.modified_ns == entry.modified_ns {
+                fs::hard_link(&source, &destination)
+                    .or_else(|_| fs::copy(&source, &destination).map(|_| ()))?;
+            } else {
+                fs::copy(&source, &destination)?;
+            }
+        }
+        let actual_hash = sha256(&destination)?;
+        if actual_hash != entry.sha256 {
+            bail!(
+                "remote object checksum mismatch for {}: expected {}, got {}",
+                entry.path,
+                entry.sha256,
+                actual_hash
+            );
+        }
+        let seconds = entry.modified_ns.div_euclid(1_000_000_000);
+        let nanos = entry.modified_ns.rem_euclid(1_000_000_000) as u32;
+        let current = fs::metadata(&destination)?
+            .modified()?
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos() as i64;
+        if current != entry.modified_ns {
+            filetime::set_file_mtime(
+                &destination,
+                filetime::FileTime::from_unix_time(seconds, nanos),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn stamp() -> String {
     Utc::now().format("%Y%m%d-%H%M%S-%6f").to_string()
-}
-
-pub fn cache_path(options: &SyncOptions, agent: &str, peer: &str) -> Result<PathBuf> {
-    let base = options
-        .cache_dir
-        .clone()
-        .or_else(|| dirs::cache_dir().map(|path| path.join("agent-sync")))
-        .context("cannot determine cache directory; pass --cache-dir")?;
-    let safe_peer: String = peer
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "_.-".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let resource = match options.resources {
-        ResourceSelection::All => "all",
-        ResourceSelection::Sessions => "sessions",
-        ResourceSelection::Memory => "memory",
-    };
-    let path = base.join(agent).join(safe_peer).join(resource);
-    private_dir(&path)?;
-    Ok(path)
 }
 
 pub fn copy_file_atomic(source: &Path, destination: &Path) -> Result<()> {
@@ -1132,5 +1265,35 @@ mod tests {
         assert!(changes.iter().any(|change| {
             change.display_path == "udeer/hidden-sprouting-crescent/subagent-a62839…99f/meta"
         }));
+    }
+
+    #[test]
+    fn inventory_reuses_unchanged_hashes_and_materializes_by_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let view = temp.path().join("view");
+        private_dir(&local).unwrap();
+        private_dir(&view).unwrap();
+        fs::write(local.join("local-name.jsonl"), "same\n").unwrap();
+
+        let first = inventory(&local, |_| false).unwrap();
+        let (second, reused) = inventory_cached(&local, |_| false, Some(&first)).unwrap();
+        assert_eq!(reused, 1);
+        assert_eq!(second.reused_entries, 1);
+
+        let source = &second.entries[0];
+        let remote = Inventory {
+            generation: "remote".into(),
+            entries: vec![InventoryEntry {
+                path: "remote-name.jsonl".into(),
+                sha256: source.sha256.clone(),
+                size: source.size,
+                modified_ns: source.modified_ns,
+            }],
+            reused_entries: 0,
+        };
+        assert!(inventory_transfer_paths(&second, &remote).is_empty());
+        complete_remote_view(&local, &second, &view, &remote).unwrap();
+        assert_eq!(fs::read(view.join("remote-name.jsonl")).unwrap(), b"same\n");
     }
 }

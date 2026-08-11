@@ -1,4 +1,4 @@
-use crate::core::private_dir;
+use crate::core::{ResourceSelection, private_dir, safe_relative};
 use crate::remote::{PROTOCOL_VERSION, Request, Response};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -76,16 +76,26 @@ impl SshTransport {
         Ok(output)
     }
 
-    pub fn pull(&self, remote_root: &str, local: &Path, filters: &[&str]) -> Result<()> {
+    pub fn pull_files(&self, remote_root: &str, local: &Path, paths: &[String]) -> Result<()> {
         private_dir(local)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut list = tempfile::NamedTempFile::new()?;
+        for path in paths {
+            let relative = Path::new(path);
+            safe_relative(relative)?;
+            if path.contains(['\n', '\r']) {
+                bail!("unsafe newline in transfer path: {path:?}");
+            }
+            writeln!(list, "{path}")?;
+        }
+        list.flush()?;
         let mut command = Command::new(&self.rsync);
         self.configure_rsync(&mut command);
-        command.args(["--delete", "--delete-excluded", "--prune-empty-dirs"]);
-        for filter in filters {
-            command.arg(filter);
-        }
-        command.args(["-e", &self.ssh]);
         command
+            .arg(format!("--files-from={}", list.path().display()))
+            .args(["-e", &self.ssh])
             .arg(format!(
                 "{}:{}/",
                 self.host,
@@ -97,7 +107,7 @@ impl SshTransport {
             .with_context(|| format!("run {}", self.rsync))?;
         if !output.status.success() {
             bail!(
-                "rsync pull failed: {}",
+                "rsync selective pull failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -189,6 +199,42 @@ impl SshTransport {
             .with_context(|| format!("decode remote helper response: {}", line.trim()))?;
         validate_response(&response)?;
         Ok(RemoteGuard { child })
+    }
+
+    pub fn remote_node_id(&self) -> Result<String> {
+        let value: serde_json::Value = self.remote_request(&Request::NodeId)?;
+        value
+            .get("node_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .context("remote helper omitted node id")
+    }
+
+    pub fn sync_guards(
+        &self,
+        local_state_root: &Path,
+        local_node_id: &str,
+        remote_node_id: &str,
+        agent: &str,
+        resources: ResourceSelection,
+    ) -> Result<SyncGuards> {
+        let request = Request::HoldSyncLock {
+            agent: agent.to_owned(),
+            resources,
+        };
+        let (local, remote) = if local_node_id <= remote_node_id {
+            let local = crate::state::acquire_sync_lock(local_state_root, agent, resources)?;
+            let remote = self.remote_guard(&request)?;
+            (local, remote)
+        } else {
+            let remote = self.remote_guard(&request)?;
+            let local = crate::state::acquire_sync_lock(local_state_root, agent, resources)?;
+            (local, remote)
+        };
+        Ok(SyncGuards {
+            _local: local,
+            _remote: remote,
+        })
     }
 
     fn raw_request<T: DeserializeOwned>(&self, path: &str, request: &Request) -> Result<T> {
@@ -293,6 +339,11 @@ impl SshTransport {
 
 pub struct RemoteGuard {
     child: Child,
+}
+
+pub struct SyncGuards {
+    _local: crate::state::SyncLock,
+    _remote: RemoteGuard,
 }
 
 impl Drop for RemoteGuard {

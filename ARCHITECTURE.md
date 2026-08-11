@@ -53,10 +53,17 @@ duplicates, undeclared content, and expansion limits before adapter validation.
 Codex and Claude archives use their normal path allowlists and validators;
 OpenCode archives use official session exports and semantic session hashes.
 
-The current transfer backend remains rsync. The next transport step is a
-manifest/file-stream RPC with append-aware JSONL transfer; it can replace
-rsync without changing the adapter contract or the remote safety operations.
-Rsync payloads are compressed and may be rate-limited per invocation or peer.
-All readback phases update the same persistent remote snapshot, so their safety
-fingerprints cost a file-list exchange plus actual deltas rather than another
-full download into an empty directory.
+Codex and Claude use a typed remote inventory RPC before transfer. The
+coordinator materializes a temporary remote view from matching local objects
+and selectively rsyncs only hashes that are unavailable locally. Stale-plan and
+final verification compare inventory generations and content manifests, so no
+persistent full-content remote snapshot is required. Successful applies write
+small per-peer checkpoints on both endpoints; exact size/mtime matches reuse
+previous hashes while missing or invalid state safely falls back to hashing.
+
+Remote scans and applies share a stable per-agent kernel lock. Apply acquires
+both endpoint locks in node-ID order, then revalidates the prepared generation.
+This serializes mini I/O and writes across multiple peers without holding locks
+during interactive conflict editing. The next transport step is append-aware
+JSONL range transfer and a sparse operation journal, replacing the temporary
+materialized view while retaining the same manifest and locking protocol.

@@ -3,6 +3,7 @@ mod archive;
 mod config;
 mod core;
 mod remote;
+mod state;
 mod transport;
 
 use anyhow::{Context, Result, bail};
@@ -117,6 +118,7 @@ struct SyncArgs {
     yes: bool,
     #[arg(short = 't', long, default_value_t = 2.0, value_parser = parse_stability)]
     stability_seconds: f64,
+    /// Directory for per-peer checkpoints, scan hashes, node identity, and sync locks.
     #[arg(short = 'C', long)]
     cache_dir: Option<PathBuf>,
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Human)]

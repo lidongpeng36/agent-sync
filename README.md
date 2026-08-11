@@ -70,11 +70,18 @@ names remain required outside a configured agent directory.
 default `yes`. Non-interactive use requires both `--apply --yes`; `--yes`
 confirms the staged plan but does not change its conflict strategy.
 
-Rsync-backed Codex and Claude transfers are compressed. Preview, stale-plan
-checks, stability checks, and final verification reuse the same persistent
-remote snapshot, so unchanged data is not downloaded again. On a shared or
-latency-sensitive link, `--bwlimit <KiB/s>` reserves bandwidth for interactive
-SSH; the same ceiling can be stored as `bandwidth_limit_kbps` under a peer.
+Codex and Claude first exchange SHA-256 manifests, then rsync only remote
+objects whose content is unavailable locally. Identical cold-start trees do not
+require a full remote download. Successful applies store small per-peer
+checkpoints on both endpoints; unchanged size/mtime entries reuse their prior
+hash on later scans. Transfers are compressed. On a shared or latency-sensitive
+link, `--bwlimit <KiB/s>` reserves bandwidth for interactive SSH; the same
+ceiling can be stored as `bandwidth_limit_kbps` under a peer.
+OpenCode exchanges canonical session hashes in one helper request and batch
+exports only sessions whose semantic hash differs; it no longer opens one SSH
+connection per session.
+Manifest reports label selected payload sizes as `uncompressed bytes`; this is
+the logical source size before rsync compression, not measured SSH wire usage.
 
 The default resource set is `sessions` plus `memory`; select one with
 `--only sessions` or `--only memory`. Add `--format json` for machine-readable
@@ -215,10 +222,15 @@ converge. Conflict strategy does not apply to OpenCode sessions.
   preserved as separate UUIDs.
 - Active writers are detected before writes; active Codex sessions are excluded,
   and Codex coordination locks are held through the remaining file transaction.
+- Expensive remote scans and applies use the same per-agent kernel lock. Apply
+  locks are acquired on both endpoints in stable node-ID order, preventing
+  concurrent mini writers and cross-direction deadlocks. Plans are never trusted
+  after their manifest generation changes.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
-- Repeated safety reads update one persistent rsync snapshot, preserving full
-  stale-plan verification without retransmitting unchanged session archives.
+- Repeated safety checks exchange manifests rather than downloading readback
+  snapshots. Per-peer checkpoints are optional optimization state; missing or
+  invalid state falls back to hashing and manifest exchange, not full transfer.
 - OpenCode backups remain on their originating machine, and account,
   credential, permission, and authentication tables are never transferred.
 - Portable local archives are checksummed, path-confined, versioned, and

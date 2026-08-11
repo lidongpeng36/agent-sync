@@ -1,9 +1,9 @@
 use super::{Adapter, Prepared};
 use crate::core::{
     Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PlanReport, ResourceSelection,
-    SyncOptions, bytes_sha256, cache_path, choose_interactively, copy_file_atomic,
-    edit_conflict_documents, fingerprint, manifest, planned_file_changes, print_planned_diff,
-    private_dir, safe_relative, sha256, stamp,
+    SyncOptions, bytes_sha256, choose_interactively, complete_remote_view, copy_file_atomic,
+    edit_conflict_documents, inventory, inventory_cached, inventory_transfer_paths, manifest,
+    planned_file_changes, print_planned_diff, private_dir, safe_relative, sha256, stamp,
 };
 use crate::remote::{MtimeUpdate, Request as RemoteRequest, create_backup};
 use crate::transport::SshTransport;
@@ -46,12 +46,15 @@ pub struct ClaudePrepared {
     pub report: PlanReport,
     temp: TempDir,
     stage: PathBuf,
-    remote_snapshot: PathBuf,
+    remote_view: PathBuf,
     local_fingerprint: String,
     remote_fingerprint: String,
     conflicts: Vec<MemoryConflict>,
     choices: BTreeMap<(String, String), MemoryChoice>,
     resources: ResourceSelection,
+    state_root: PathBuf,
+    local_node_id: String,
+    remote_node_id: String,
 }
 
 pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> {
@@ -70,7 +73,7 @@ pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> 
             blocker.resource, blocker.path, blocker.reason
         );
     }
-    print_planned_diff(local, &prepared.remote_snapshot, &prepared.stage, |path| {
+    print_planned_diff(local, &prepared.remote_view, &prepared.stage, |path| {
         excluded(path, prepared.resources)
     })
 }
@@ -183,11 +186,38 @@ impl Adapter for ClaudeAdapter {
         let temp = tempfile::Builder::new()
             .prefix("agent-sync-claude-")
             .tempdir()?;
-        let remote = cache_path(options, "claude", &transport.host)?;
-        pull_claude(transport, remote_root, &remote, options.resources)?;
+        let scan_guard = transport.remote_guard(&RemoteRequest::HoldSyncLock {
+            agent: "claude".to_owned(),
+            resources: options.resources,
+        })?;
+        let remote = temp.path().join("remote-view");
+        private_dir(&remote)?;
+        let exclude = |path: &Path| excluded(path, options.resources);
+        let state_root = crate::state::state_root(options)?;
+        let local_node_id = crate::state::node_id(&state_root)?;
+        let remote_node_id = transport.remote_node_id()?;
+        let previous =
+            crate::state::load(&state_root, "claude", &transport.host, options.resources)?;
+        let (local_inventory, reused) = inventory_cached(
+            local,
+            exclude,
+            previous.as_ref().map(|value| &value.inventory),
+        )?;
+        let remote_inventory: crate::core::Inventory =
+            transport.remote_request(&RemoteRequest::Inventory {
+                root: remote_root.to_owned(),
+                agent: "claude".to_owned(),
+                resources: options.resources,
+                excluded_ids: Vec::new(),
+                peer_id: local_node_id.clone(),
+            })?;
+        let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
+        transport.pull_files(remote_root, &remote, &transfer)?;
+        complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
+        drop(scan_guard);
         let stage = temp.path().join("stage");
         private_dir(&stage)?;
-        let (report, conflicts) = build_stage(
+        let (mut report, conflicts) = build_stage(
             local,
             &remote,
             &stage,
@@ -196,18 +226,33 @@ impl Adapter for ClaudeAdapter {
             &transport.host,
             options.conflict_strategy,
         )?;
-        let exclude = |p: &Path| excluded(p, options.resources);
-        let remote_fingerprint = fingerprint(&remote, exclude)?;
+        let transferred_bytes = remote_inventory
+            .entries
+            .iter()
+            .filter(|entry| transfer.contains(&entry.path))
+            .map(|entry| entry.size)
+            .sum::<u64>();
+        report.notes.push(format!(
+            "manifest: hashes reused local={reused}/{}, remote={}/{}; objects fetched={}/{} uncompressed bytes",
+            local_inventory.entries.len(),
+            remote_inventory.reused_entries,
+            remote_inventory.entries.len(),
+            transfer.len(),
+            transferred_bytes
+        ));
         Ok(Prepared::Claude(ClaudePrepared {
             report,
             temp,
             stage,
-            remote_snapshot: remote,
-            local_fingerprint: fingerprint(local, exclude)?,
-            remote_fingerprint,
+            remote_view: remote,
+            local_fingerprint: local_inventory.generation,
+            remote_fingerprint: remote_inventory.generation,
             conflicts,
             choices: BTreeMap::new(),
             resources: options.resources,
+            state_root,
+            local_node_id,
+            remote_node_id,
         }))
     }
 
@@ -250,7 +295,7 @@ impl Adapter for ClaudeAdapter {
         fs::remove_dir_all(&value.stage)?;
         private_dir(&value.stage)?;
         let (report, _) = build_stage_from_choices(
-            &value.remote_snapshot,
+            &value.remote_view,
             &value.stage,
             value.resources,
             &value.choices,
@@ -274,30 +319,37 @@ impl Adapter for ClaudeAdapter {
             bail!("adapter/prepared plan mismatch");
         };
         let exclude = |p: &Path| excluded(p, value.resources);
-        if fingerprint(local, exclude)? != value.local_fingerprint {
-            bail!("local Claude data changed after preview");
-        }
-        pull_claude(
-            transport,
-            remote_root,
-            &value.remote_snapshot,
+        let _sync_guards = transport.sync_guards(
+            &value.state_root,
+            &value.local_node_id,
+            &value.remote_node_id,
+            "claude",
             value.resources,
         )?;
-        if fingerprint(&value.remote_snapshot, exclude)? != value.remote_fingerprint {
+        if inventory(local, exclude)?.generation != value.local_fingerprint {
+            bail!("local Claude data changed after preview");
+        }
+        let current_remote = remote_inventory(
+            transport,
+            remote_root,
+            value.resources,
+            &value.local_node_id,
+        )?;
+        if current_remote.generation != value.remote_fingerprint {
             bail!("remote Claude data changed after preview");
         }
         ensure_no_writers(local, remote_root, transport)?;
         thread::sleep(Duration::from_secs_f64(options.stability_seconds));
-        if fingerprint(local, exclude)? != value.local_fingerprint {
+        if inventory(local, exclude)?.generation != value.local_fingerprint {
             bail!("local Claude writer is active");
         }
-        pull_claude(
+        let stable_remote = remote_inventory(
             transport,
             remote_root,
-            &value.remote_snapshot,
             value.resources,
+            &value.local_node_id,
         )?;
-        if fingerprint(&value.remote_snapshot, exclude)? != value.remote_fingerprint {
+        if stable_remote.generation != value.remote_fingerprint {
             bail!("remote Claude writer is active");
         }
         ensure_no_writers(local, remote_root, transport)?;
@@ -311,23 +363,37 @@ impl Adapter for ClaudeAdapter {
             normalize_local_mtimes(&value.stage, local)?;
             normalize_remote_mtimes(&value.stage, remote_root, transport)?;
         }
-        pull_claude(
+        verify_selected(&value.stage, local, value.resources, "local")?;
+        let verified_remote = remote_inventory(
             transport,
             remote_root,
-            &value.remote_snapshot,
             value.resources,
+            &value.local_node_id,
         )?;
-        verify_selected(&value.stage, local, value.resources, "local")?;
-        verify_selected(
-            &value.stage,
-            &value.remote_snapshot,
-            value.resources,
-            "remote",
-        )?;
+        verify_remote_inventory(&value.stage, &verified_remote, value.resources)?;
         if value.resources.sessions() {
             verify_event_mtimes(local, "local")?;
-            verify_event_mtimes(&value.remote_snapshot, "remote")?;
+            verify_remote_event_mtimes(&value.stage, &verified_remote)?;
         }
+        let final_inventory = inventory(local, exclude)?;
+        let local_checkpoint = crate::state::Checkpoint::new(
+            "claude",
+            value.resources,
+            &transport.host,
+            final_inventory,
+        );
+        let mut remote_checkpoint = local_checkpoint.clone();
+        remote_checkpoint.peer = value.local_node_id;
+        remote_checkpoint.inventory = verified_remote;
+        remote_checkpoint.result_content_hash =
+            crate::state::content_hash(&remote_checkpoint.inventory);
+        if remote_checkpoint.result_content_hash != local_checkpoint.result_content_hash {
+            bail!("cannot checkpoint divergent Claude results");
+        }
+        let _: Value = transport.remote_request(&RemoteRequest::SaveCheckpoint {
+            checkpoint: remote_checkpoint,
+        })?;
+        crate::state::save(&value.state_root, &local_checkpoint)?;
         println!(
             "complete: Claude synchronized and verified; backups: local={}, remote={}:{}",
             local_backup.display(),
@@ -336,66 +402,6 @@ impl Adapter for ClaudeAdapter {
         );
         Ok(())
     }
-}
-
-fn pull_claude(
-    transport: &SshTransport,
-    root: &str,
-    destination: &Path,
-    resources: ResourceSelection,
-) -> Result<()> {
-    let filters = match resources {
-        ResourceSelection::All => vec![
-            "--include=/projects/",
-            "--include=/projects/*/",
-            "--include=/projects/*/memory/",
-            "--include=/projects/*/memory/*.md",
-            "--exclude=/projects/*/memory/***",
-            "--include=/projects/***",
-            "--exclude=*",
-        ],
-        ResourceSelection::Sessions => vec![
-            "--exclude=/projects/*/memory/***",
-            "--include=/projects/***",
-            "--exclude=*",
-        ],
-        ResourceSelection::Memory => vec![
-            "--include=/projects/",
-            "--include=/projects/*/",
-            "--include=/projects/*/memory/",
-            "--include=/projects/*/memory/*.md",
-            "--exclude=*",
-        ],
-    };
-    transport.pull(root, destination, &filters)?;
-    if resources.sessions() {
-        refresh_remote_mtimes(transport, root, destination, resources)?;
-    }
-    Ok(())
-}
-
-fn refresh_remote_mtimes(
-    transport: &SshTransport,
-    root: &str,
-    snapshot: &Path,
-    resources: ResourceSelection,
-) -> Result<()> {
-    let mtimes: BTreeMap<String, i64> = transport.remote_request(&RemoteRequest::ClaudeMtimes {
-        root: root.to_owned(),
-        include_memory: resources.memory(),
-    })?;
-    for (relative, ns) in mtimes {
-        let relative = PathBuf::from(relative);
-        safe_relative(&relative)?;
-        let path = snapshot.join(relative);
-        if path.exists() {
-            filetime::set_file_mtime(
-                path,
-                FileTime::from_unix_time(ns / 1_000_000_000, (ns % 1_000_000_000) as u32),
-            )?;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn archive_excluded(path: &Path, resources: ResourceSelection) -> bool {
@@ -423,6 +429,50 @@ pub(crate) fn archive_excluded(path: &Path, resources: ResourceSelection) -> boo
 
 fn excluded(path: &Path, resources: ResourceSelection) -> bool {
     archive_excluded(path, resources)
+}
+
+fn remote_inventory(
+    transport: &SshTransport,
+    root: &str,
+    resources: ResourceSelection,
+    peer_id: &str,
+) -> Result<crate::core::Inventory> {
+    transport.remote_request(&RemoteRequest::Inventory {
+        root: root.to_owned(),
+        agent: "claude".to_owned(),
+        resources,
+        excluded_ids: Vec::new(),
+        peer_id: peer_id.to_owned(),
+    })
+}
+
+fn verify_remote_inventory(
+    stage: &Path,
+    actual: &crate::core::Inventory,
+    resources: ResourceSelection,
+) -> Result<()> {
+    let expected = inventory(stage, |path| excluded(path, resources))?;
+    if expected.content_manifest() != actual.content_manifest() {
+        bail!("remote final file set or content differs from the staged manifest");
+    }
+    Ok(())
+}
+
+fn verify_remote_event_mtimes(stage: &Path, actual: &crate::core::Inventory) -> Result<()> {
+    let actual = actual.by_path();
+    for (path, file) in session_files(stage)? {
+        let Some(event_ns) = file.event_ns else {
+            continue;
+        };
+        let relative = path.to_string_lossy();
+        let remote = actual
+            .get(relative.as_ref())
+            .with_context(|| format!("remote omitted Claude session file {relative}"))?;
+        if remote.modified_ns != event_ns {
+            bail!("remote Claude JSONL mtime differs from its last event: {relative}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_archive_snapshot(root: &Path, resources: ResourceSelection) -> Result<()> {
