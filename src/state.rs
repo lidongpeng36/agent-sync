@@ -253,9 +253,14 @@ pub fn load(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)
-        .with_context(|| format!("decode checkpoint {}", path.display()))?;
-    checkpoint.validate(agent, resources, peer)?;
+    // Checkpoints only cache hashes from a prior successful scan. Corrupt,
+    // stale, or mismatched cache data must never prevent a fresh inventory.
+    let Ok(checkpoint) = serde_json::from_slice::<Checkpoint>(&bytes) else {
+        return Ok(None);
+    };
+    if checkpoint.validate(agent, resources, peer).is_err() {
+        return Ok(None);
+    }
     Ok(Some(checkpoint))
 }
 
@@ -389,6 +394,48 @@ mod tests {
         assert_eq!(loaded.result_content_hash, checkpoint.result_content_hash);
         assert!(
             load(temp.path(), "codex", "other", ResourceSelection::Sessions)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_checkpoint_is_treated_as_a_cache_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let path =
+            checkpoint_path(temp.path(), "codex", "mini", ResourceSelection::Sessions).unwrap();
+        private_dir(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not json\n").unwrap();
+
+        assert!(
+            load(temp.path(), "codex", "mini", ResourceSelection::Sessions)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_checkpoint_checksum_is_treated_as_a_cache_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let inventory = Inventory::new(
+            vec![InventoryEntry {
+                path: "sessions/a.jsonl".into(),
+                sha256: "content".into(),
+                size: 12,
+                modified_ns: 34,
+            }],
+            0,
+        );
+        let mut checkpoint =
+            Checkpoint::new("codex", ResourceSelection::Sessions, "mini", inventory);
+        checkpoint.result_content_hash = "0".repeat(64);
+        let path =
+            checkpoint_path(temp.path(), "codex", "mini", ResourceSelection::Sessions).unwrap();
+        private_dir(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+        assert!(
+            load(temp.path(), "codex", "mini", ResourceSelection::Sessions)
                 .unwrap()
                 .is_none()
         );
