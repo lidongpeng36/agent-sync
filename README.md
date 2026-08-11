@@ -264,15 +264,31 @@ compatible `codex app-server`, and OpenCode synchronization needs a compatible
 and SQLite maintenance are implemented in Rust and do not require `tar` or
 `python3`.
 
+### Cache and interrupted-transaction recovery
+
+Per-peer checkpoints below the agent-sync cache contain only reusable hashes
+and revision metadata. They are never a source of truth: a missing, malformed,
+stale, identity-mismatched, or checksum-invalid checkpoint is treated as a
+cache miss and causes a fresh inventory scan.
+
+Transaction journals are different. If a process stops after either endpoint
+has been modified, the next apply refuses to write and reports the transaction
+phase plus both backup paths. Keep those backups and inspect both endpoints
+before recovery; do not remove the journal merely to bypass the guard. A
+verified transaction whose final journal cleanup was interrupted is cleared
+automatically.
+
 ## Development
 
 ```console
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+git diff --check
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the adapter boundary and invariants.
+See [AGENTS.md](AGENTS.md) for repository working rules and required validation,
+and [ARCHITECTURE.md](ARCHITECTURE.md) for the adapter boundary and invariants.
 
 ## 中文快速开始
 
@@ -321,6 +337,12 @@ session export，不包含数据库或凭据。
 `local`、`remote` 或通过 `$EDITOR` 编辑。旧值 `merge` 兼容映射为 `ask`。
 OpenCode 当前只同步 session，通过官方 `export`/`import` 接口工作，不复制
 包含凭据的数据库；线性历史取较长版本，真实分叉使用确定性 ID 分别保留。
+
+同步使用两端 manifest、增量 rsync 和 per-peer checkpoint，稳定状态下不会重复
+下载或重新计算未变化内容。共享 SSH 链路可以使用 `--bwlimit <KiB/s>` 限速。
+Codex 正在写入的 session 会被警告并跳过，其他内容继续同步；Claude 和
+OpenCode 在检测到 writer 时拒绝 apply。损坏的 checkpoint 会自动退化为重新
+扫描；未完成的事务 journal 则会阻止继续写入，并输出两端备份位置供恢复。
 
 ## License
 

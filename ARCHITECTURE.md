@@ -1,6 +1,6 @@
 # Architecture
 
-The binary has four layers:
+The binary has five layers:
 
 1. `SshTransport` invokes OpenSSH, bootstraps the matching remote helper, and
    performs the remaining allowlisted rsync snapshots and staged transfers
@@ -29,10 +29,11 @@ An adapter implements `doctor`, `prepare`, conflict mapping and validation, and
 `apply`. The local/remote/editor prompt, editor selection, private edit files,
 conflict markers, and marker validation are shared core behavior; adapters only
 validate agent-specific edited formats and update their staged metadata.
-`prepare` must be read-only and produce a complete staged tree, blockers, and a
-file-granularity plan. Human and JSON output render that plan; diff output
-compares each side with the same staged tree. `apply` must reject a stale plan,
-back up before mutation, install the stage, and verify a fresh remote readback.
+`prepare` must be read-only and produce a complete result manifest, the staged
+content needed for changes, blockers, and a file-granularity plan. Human and
+JSON output render that plan; diff output compares each changed side with the
+same staged result. `apply` must reject a stale plan, back up before mutation,
+install the stage, and verify a fresh remote readback.
 Codex active-session exclusion also defers its aggregate history/index files and
 catalog/state repair, preventing an excluded live rollout from being changed
 through derived metadata while unrelated resources continue to synchronize.
