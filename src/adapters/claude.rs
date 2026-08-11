@@ -277,9 +277,13 @@ impl Adapter for ClaudeAdapter {
         if fingerprint(local, exclude)? != value.local_fingerprint {
             bail!("local Claude data changed after preview");
         }
-        let recheck = value.temp.path().join("remote-recheck");
-        pull_claude(transport, remote_root, &recheck, value.resources)?;
-        if fingerprint(&recheck, exclude)? != value.remote_fingerprint {
+        pull_claude(
+            transport,
+            remote_root,
+            &value.remote_snapshot,
+            value.resources,
+        )?;
+        if fingerprint(&value.remote_snapshot, exclude)? != value.remote_fingerprint {
             bail!("remote Claude data changed after preview");
         }
         ensure_no_writers(local, remote_root, transport)?;
@@ -287,9 +291,13 @@ impl Adapter for ClaudeAdapter {
         if fingerprint(local, exclude)? != value.local_fingerprint {
             bail!("local Claude writer is active");
         }
-        let stable = value.temp.path().join("remote-stable");
-        pull_claude(transport, remote_root, &stable, value.resources)?;
-        if fingerprint(&stable, exclude)? != value.remote_fingerprint {
+        pull_claude(
+            transport,
+            remote_root,
+            &value.remote_snapshot,
+            value.resources,
+        )?;
+        if fingerprint(&value.remote_snapshot, exclude)? != value.remote_fingerprint {
             bail!("remote Claude writer is active");
         }
         ensure_no_writers(local, remote_root, transport)?;
@@ -303,13 +311,22 @@ impl Adapter for ClaudeAdapter {
             normalize_local_mtimes(&value.stage, local)?;
             normalize_remote_mtimes(&value.stage, remote_root, transport)?;
         }
-        let verified = value.temp.path().join("remote-verified");
-        pull_claude(transport, remote_root, &verified, value.resources)?;
+        pull_claude(
+            transport,
+            remote_root,
+            &value.remote_snapshot,
+            value.resources,
+        )?;
         verify_selected(&value.stage, local, value.resources, "local")?;
-        verify_selected(&value.stage, &verified, value.resources, "remote")?;
+        verify_selected(
+            &value.stage,
+            &value.remote_snapshot,
+            value.resources,
+            "remote",
+        )?;
         if value.resources.sessions() {
             verify_event_mtimes(local, "local")?;
-            verify_event_mtimes(&verified, "remote")?;
+            verify_event_mtimes(&value.remote_snapshot, "remote")?;
         }
         println!(
             "complete: Claude synchronized and verified; backups: local={}, remote={}:{}",

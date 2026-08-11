@@ -51,6 +51,7 @@ agent-sync sync claude mini -s ask
 agent-sync s claude -f diff > claude-sync.diff
 agent-sync sync codex mini --only memory --apply
 agent-sync sync claude mini --apply --yes
+agent-sync sync codex mini --bwlimit 16384
 agent-sync doctor codex mini
 cd ~/.codex && agent-sync sync mini       # infers codex
 agent-sync export codex codex-backup.tar.gz
@@ -68,6 +69,12 @@ names remain required outside a configured agent directory.
 `--apply` asks `Apply these changes? [Y/n]` in a terminal; Enter accepts the
 default `yes`. Non-interactive use requires both `--apply --yes`; `--yes`
 confirms the staged plan but does not change its conflict strategy.
+
+Rsync-backed Codex and Claude transfers are compressed. Preview, stale-plan
+checks, stability checks, and final verification reuse the same persistent
+remote snapshot, so unchanged data is not downloaded again. On a shared or
+latency-sensitive link, `--bwlimit <KiB/s>` reserves bandwidth for interactive
+SSH; the same ceiling can be stored as `bandwidth_limit_kbps` under a peer.
 
 The default resource set is `sessions` plus `memory`; select one with
 `--only sessions` or `--only memory`. Add `--format json` for machine-readable
@@ -145,6 +152,8 @@ conflict_strategy = "ask"
 
 [peers.mini]
 host = "mini"
+# Optional rsync ceiling in KiB/s; useful on a shared or latency-sensitive link.
+bandwidth_limit_kbps = 16384
 
 [agents.codex]
 local_root = "~/.codex"
@@ -208,6 +217,8 @@ converge. Conflict strategy does not apply to OpenCode sessions.
   and Codex coordination locks are held through the remaining file transaction.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
+- Repeated safety reads update one persistent rsync snapshot, preserving full
+  stale-plan verification without retransmitting unchanged session archives.
 - OpenCode backups remain on their originating machine, and account,
   credential, permission, and authentication tables are never transferred.
 - Portable local archives are checksummed, path-confined, versioned, and

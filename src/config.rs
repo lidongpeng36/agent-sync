@@ -25,6 +25,7 @@ struct Peer {
     host: Option<String>,
     ssh: Option<String>,
     rsync: Option<String>,
+    bandwidth_limit_kbps: Option<u64>,
     #[serde(default)]
     roots: BTreeMap<String, String>,
 }
@@ -44,6 +45,7 @@ pub struct Resolved {
     pub host: String,
     pub ssh: String,
     pub rsync: String,
+    pub bandwidth_limit_kbps: Option<u64>,
     pub local_root: PathBuf,
     pub remote_root: String,
 }
@@ -110,6 +112,7 @@ impl Config {
             rsync: peer
                 .and_then(|p| p.rsync.clone())
                 .unwrap_or_else(|| "rsync".to_owned()),
+            bandwidth_limit_kbps: peer.and_then(|peer| peer.bandwidth_limit_kbps),
             local_root,
             remote_root,
         })
@@ -279,6 +282,22 @@ mod tests {
         assert_eq!(configured.peer_name(None).unwrap(), "mini");
         assert_eq!(configured.peer_name(Some("dev")).unwrap(), "dev");
         assert!(Config::default().peer_name(None).is_err());
+    }
+
+    #[test]
+    fn peer_bandwidth_limit_is_resolved() {
+        let configured: Config = toml::from_str(
+            r#"
+            version = 1
+            [peers.mini]
+            bandwidth_limit_kbps = 16384
+            "#,
+        )
+        .unwrap();
+        let resolved = configured
+            .resolve(AgentKind::Codex, "mini", None, None)
+            .unwrap();
+        assert_eq!(resolved.bandwidth_limit_kbps, Some(16_384));
     }
 
     #[test]

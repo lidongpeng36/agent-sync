@@ -13,15 +13,22 @@ pub struct SshTransport {
     pub host: String,
     pub ssh: String,
     pub rsync: String,
+    bandwidth_limit_kbps: Option<u64>,
     helper: Arc<OnceLock<String>>,
 }
 
 impl SshTransport {
-    pub fn new(host: String, ssh: String, rsync: String) -> Self {
+    pub fn new(
+        host: String,
+        ssh: String,
+        rsync: String,
+        bandwidth_limit_kbps: Option<u64>,
+    ) -> Self {
         Self {
             host,
             ssh,
             rsync,
+            bandwidth_limit_kbps,
             helper: Arc::new(OnceLock::new()),
         }
     }
@@ -72,7 +79,8 @@ impl SshTransport {
     pub fn pull(&self, remote_root: &str, local: &Path, filters: &[&str]) -> Result<()> {
         private_dir(local)?;
         let mut command = Command::new(&self.rsync);
-        command.args(["-a", "--delete", "--delete-excluded", "--prune-empty-dirs"]);
+        self.configure_rsync(&mut command);
+        command.args(["--delete", "--delete-excluded", "--prune-empty-dirs"]);
         for filter in filters {
             command.arg(filter);
         }
@@ -97,8 +105,10 @@ impl SshTransport {
     }
 
     pub fn push(&self, source: &Path, remote_root: &str) -> Result<()> {
-        let output = Command::new(&self.rsync)
-            .args(["-a", "-e", &self.ssh])
+        let mut command = Command::new(&self.rsync);
+        self.configure_rsync(&mut command);
+        let output = command
+            .args(["-e", &self.ssh])
             .arg(format!("{}/", source.display()))
             .arg(format!(
                 "{}:{}/",
@@ -113,6 +123,13 @@ impl SshTransport {
             );
         }
         Ok(())
+    }
+
+    fn configure_rsync(&self, command: &mut Command) {
+        command.args(["-a", "--compress"]);
+        if let Some(limit) = self.bandwidth_limit_kbps {
+            command.arg(format!("--bwlimit={limit}"));
+        }
     }
 
     pub fn ensure_remote_helper(&self) -> Result<&str> {
@@ -307,4 +324,22 @@ fn validate_response(response: &Response) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsync_transfers_are_compressed_and_optionally_limited() {
+        let transport =
+            SshTransport::new("mini".into(), "ssh".into(), "rsync".into(), Some(12_345));
+        let mut command = Command::new("rsync");
+        transport.configure_rsync(&mut command);
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["-a", "--compress", "--bwlimit=12345"]);
+    }
 }

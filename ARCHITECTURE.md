@@ -56,3 +56,7 @@ OpenCode archives use official session exports and semantic session hashes.
 The current transfer backend remains rsync. The next transport step is a
 manifest/file-stream RPC with append-aware JSONL transfer; it can replace
 rsync without changing the adapter contract or the remote safety operations.
+Rsync payloads are compressed and may be rate-limited per invocation or peer.
+All readback phases update the same persistent remote snapshot, so their safety
+fingerprints cost a file-list exchange plus actual deltas rather than another
+full download into an empty directory.

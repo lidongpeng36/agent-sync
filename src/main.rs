@@ -85,6 +85,9 @@ struct TargetArgs {
     ssh: Option<String>,
     #[arg(short = 'R', long)]
     rsync: Option<String>,
+    /// Limit rsync traffic in KiB/s so other SSH sessions remain responsive.
+    #[arg(long, value_parser = parse_bandwidth_limit)]
+    bwlimit: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -170,6 +173,14 @@ fn parse_stability(value: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_bandwidth_limit(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "must be a positive number of KiB/s".to_owned())
+}
+
 #[derive(Serialize)]
 struct AdapterInfo<'a> {
     name: &'a str,
@@ -204,11 +215,12 @@ fn resolve_target(
     )?;
     let ssh = args.ssh.clone().unwrap_or_else(|| resolved.ssh.clone());
     let rsync = args.rsync.clone().unwrap_or_else(|| resolved.rsync.clone());
+    let bandwidth_limit_kbps = args.bwlimit.or(resolved.bandwidth_limit_kbps);
     Ok((
         agent,
         resolved.local_root,
         resolved.remote_root,
-        SshTransport::new(resolved.host, ssh, rsync),
+        SshTransport::new(resolved.host, ssh, rsync, bandwidth_limit_kbps),
         peer_name,
     ))
 }
@@ -545,5 +557,19 @@ mod tests {
         };
         assert_eq!(args.target.agent_or_peer.as_deref(), Some("codex"));
         assert_eq!(args.target.peer.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn bandwidth_limit_must_be_positive() {
+        let cli = Cli::try_parse_from(["agent-sync", "sync", "codex", "mini", "--bwlimit", "8192"])
+            .unwrap();
+        let Command::Sync(args) = cli.command else {
+            panic!("expected sync command");
+        };
+        assert_eq!(args.target.bwlimit, Some(8192));
+        assert!(
+            Cli::try_parse_from(["agent-sync", "sync", "codex", "mini", "--bwlimit", "0",])
+                .is_err()
+        );
     }
 }

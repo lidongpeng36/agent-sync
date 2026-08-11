@@ -238,9 +238,13 @@ impl Adapter for CodexAdapter {
         if fingerprint(local, exclude)? != value.local_fingerprint {
             bail!("local Codex data changed after preview");
         }
-        let check = value.temp.path().join("remote-recheck");
-        pull_codex(transport, remote_root, &check, value.resources)?;
-        if fingerprint(&check, exclude)? != value.remote_fingerprint {
+        pull_codex(
+            transport,
+            remote_root,
+            &value.remote_snapshot,
+            value.resources,
+        )?;
+        if fingerprint(&value.remote_snapshot, exclude)? != value.remote_fingerprint {
             bail!("remote Codex data changed after preview");
         }
         if value.resources.sessions() && value.active.is_empty() {
@@ -256,12 +260,16 @@ impl Adapter for CodexAdapter {
         }
         install_local(&value.stage, local, &transport.rsync)?;
         transport.push(&value.stage, remote_root)?;
-        let verified = value.temp.path().join("remote-verified");
-        pull_codex(transport, remote_root, &verified, value.resources)?;
+        pull_codex(
+            transport,
+            remote_root,
+            &value.remote_snapshot,
+            value.resources,
+        )?;
         verify_selected(&value.stage, local, value.resources, &value.active, "local")?;
         verify_selected(
             &value.stage,
-            &verified,
+            &value.remote_snapshot,
             value.resources,
             &value.active,
             "remote",
