@@ -77,9 +77,10 @@ checkpoints on both endpoints; unchanged size/mtime entries reuse their prior
 hash on later scans. Transfers are compressed. On a shared or latency-sensitive
 link, `--bwlimit <KiB/s>` reserves bandwidth for interactive SSH; the same
 ceiling can be stored as `bandwidth_limit_kbps` under a peer.
-OpenCode exchanges canonical session hashes in one helper request and batch
-exports only sessions whose semantic hash differs; it no longer opens one SSH
-connection per session.
+OpenCode scans inexpensive SQLite revisions first. After a successful apply,
+per-peer checkpoints let unchanged sessions reuse their canonical semantic
+hashes without running `opencode export`; only new or revised sessions are
+batch-exported. A missing checkpoint safely performs a full hash scan once.
 Manifest reports label selected payload sizes as `uncompressed bytes`; this is
 the logical source size before rsync compression. `rsync delta` reports actual
 protocol bytes sent/received plus literal and locally matched data. Differing

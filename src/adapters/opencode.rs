@@ -1,7 +1,7 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, FileAction, FileChange, PlanReport, ResourceSelection, SyncOptions, bytes_sha256,
-    print_planned_diff, private_dir, shorten_middle, stamp,
+    Blocker, FileAction, FileChange, Inventory, InventoryEntry, PlanReport, ResourceSelection,
+    SyncOptions, bytes_sha256, print_planned_diff, private_dir, shorten_middle, stamp,
 };
 use crate::remote::Request as RemoteRequest;
 use crate::transport::SshTransport;
@@ -40,8 +40,9 @@ pub struct OpenCodePrepared {
     local_snapshot: PathBuf,
     remote_snapshot: PathBuf,
     stage: PathBuf,
-    local_fingerprint: BTreeMap<String, String>,
-    remote_fingerprint: BTreeMap<String, String>,
+    local_inventory: Inventory,
+    remote_inventory: Inventory,
+    result_fingerprint: BTreeMap<String, String>,
     state_root: PathBuf,
     local_node_id: String,
     remote_node_id: String,
@@ -200,6 +201,98 @@ fn local_session_ids(root: &Path) -> Result<Vec<String>> {
     Ok(statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+#[derive(Clone, Debug)]
+struct SessionRevision {
+    id: String,
+    modified: i64,
+    packed_counts: u64,
+}
+
+fn session_revisions(root: &Path) -> Result<Vec<SessionRevision>> {
+    let connection = Connection::open_with_flags(
+        root.join("opencode.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT s.id,
+                MAX(s.time_updated,
+                    COALESCE((SELECT MAX(m.time_updated) FROM message m WHERE m.session_id = s.id), 0),
+                    COALESCE((SELECT MAX(p.time_updated) FROM part p WHERE p.session_id = s.id), 0)),
+                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id),
+                (SELECT COUNT(*) FROM part p WHERE p.session_id = s.id)
+           FROM session s
+          ORDER BY s.id",
+    )?;
+    statement
+        .query_map([], |row| {
+            let message_count = row.get::<_, u64>(2)?;
+            let part_count = row.get::<_, u64>(3)?;
+            if message_count > u32::MAX.into() || part_count > u32::MAX.into() {
+                return Err(rusqlite::Error::IntegralValueOutOfRange(
+                    2,
+                    message_count as i64,
+                ));
+            }
+            Ok(SessionRevision {
+                id: row.get(0)?,
+                modified: row.get(1)?,
+                packed_counts: (message_count << 32) | part_count,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub(crate) fn cached_inventory(root: &Path, previous: Option<&Inventory>) -> Result<Inventory> {
+    let previous = previous.map(Inventory::by_path).unwrap_or_default();
+    let revisions = session_revisions(root)?;
+    let mut hashes = BTreeMap::new();
+    let mut dirty = Vec::new();
+    let mut reused = 0;
+    for revision in &revisions {
+        let path = format!("sessions/{}.json", revision.id);
+        if let Some(entry) = previous.get(path.as_str())
+            && entry.size == revision.packed_counts
+            && entry.modified_ns == revision.modified
+        {
+            hashes.insert(revision.id.clone(), entry.sha256.clone());
+            reused += 1;
+        } else {
+            dirty.push(revision.id.clone());
+        }
+    }
+    for (id, session) in export_local(&dirty)? {
+        hashes.insert(id, session.canonical_hash()?);
+    }
+    let entries = revisions
+        .into_iter()
+        .map(|revision| {
+            Ok(InventoryEntry {
+                path: format!("sessions/{}.json", revision.id),
+                sha256: hashes
+                    .remove(&revision.id)
+                    .context("OpenCode inventory hash was not computed")?,
+                size: revision.packed_counts,
+                modified_ns: revision.modified,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Inventory::new(entries, reused))
+}
+
+fn inventory_fingerprint(inventory: &Inventory) -> BTreeMap<String, String> {
+    inventory
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            Path::new(&entry.path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(|id| (id.to_owned(), entry.sha256.clone()))
+        })
+        .collect()
 }
 
 fn export_local_session(id: &str) -> Result<SessionExport> {
@@ -679,30 +772,31 @@ impl Adapter for OpenCodeAdapter {
             agent: "opencode".to_owned(),
             resources: options.resources,
         })?;
-        let local_ids = local_session_ids(local)?;
-        let local_sessions = export_local(&local_ids)?;
-        let local_fingerprint = fingerprint(&local_sessions)?;
-        let remote_fingerprint: BTreeMap<String, String> =
+        let previous_local =
+            crate::state::load(&state_root, "opencode", &transport.host, options.resources)?;
+        let local_inventory =
+            cached_inventory(local, previous_local.as_ref().map(|value| &value.inventory))?;
+        let remote_inventory: Inventory =
             transport.remote_request(&RemoteRequest::OpenCodeInventory {
                 root: remote.to_owned(),
+                resources: options.resources,
+                peer_id: local_node_id.clone(),
+                previous: None,
             })?;
-        let changed_remote = remote_fingerprint
+        let local_fingerprint = inventory_fingerprint(&local_inventory);
+        let remote_fingerprint = inventory_fingerprint(&remote_inventory);
+        let local_changed = local_fingerprint
+            .iter()
+            .filter(|(id, hash)| remote_fingerprint.get(*id) != Some(*hash))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let remote_changed = remote_fingerprint
             .iter()
             .filter(|(id, hash)| local_fingerprint.get(*id) != Some(*hash))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        let mut remote_sessions = export_remote(&changed_remote, transport)?;
-        for (id, hash) in &remote_fingerprint {
-            if local_fingerprint.get(id) == Some(hash) {
-                remote_sessions.insert(
-                    id.clone(),
-                    local_sessions
-                        .get(id)
-                        .context("matching local OpenCode session disappeared")?
-                        .clone(),
-                );
-            }
-        }
+        let local_sessions = export_local(&local_changed)?;
+        let remote_sessions = export_remote(&remote_changed, transport)?;
         let local_snapshot = temp.path().join("local");
         let remote_snapshot = temp.path().join("remote");
         let stage = temp.path().join("stage");
@@ -718,14 +812,28 @@ impl Adapter for OpenCodeAdapter {
             .notes
             .push("OpenCode has no separate memory resource; credentials are excluded".into());
         report.notes.push(format!(
-            "manifest: remote sessions exported={}/{}",
-            changed_remote.len(),
-            remote_fingerprint.len()
+            "manifest: hashes reused local={}/{}, remote={}/{}; sessions exported local={}, remote={}",
+            local_inventory.reused_entries,
+            local_inventory.entries.len(),
+            remote_inventory.reused_entries,
+            remote_inventory.entries.len(),
+            local_changed.len(),
+            remote_changed.len(),
         ));
+        report.identical = local_fingerprint
+            .iter()
+            .filter(|(id, hash)| remote_fingerprint.get(*id) == Some(*hash))
+            .count();
         let result = merge_exports(&local_sessions, &remote_sessions, &mut report)?;
         write_exports(&stage, &result)?;
         report.files = planned_session_changes(&local_sessions, &remote_sessions, &result)?;
         decorate_paths(&mut report.files, &result);
+        let mut result_fingerprint = local_fingerprint
+            .iter()
+            .filter(|(id, hash)| remote_fingerprint.get(*id) == Some(*hash))
+            .map(|(id, hash)| (id.clone(), hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+        result_fingerprint.extend(fingerprint(&result)?);
         if options.apply {
             let remote_writers: OpenCodeWritersResult =
                 transport.remote_request(&RemoteRequest::OpenCodeWriters {
@@ -745,8 +853,9 @@ impl Adapter for OpenCodeAdapter {
             local_snapshot,
             remote_snapshot,
             stage,
-            local_fingerprint,
-            remote_fingerprint,
+            local_inventory,
+            remote_inventory,
+            result_fingerprint,
             state_root,
             local_node_id,
             remote_node_id,
@@ -776,15 +885,19 @@ impl Adapter for OpenCodeAdapter {
             options.resources,
         )?;
         transport.ensure_no_pending_transaction(&value.state_root, "opencode")?;
-        let current_local = export_local(&local_session_ids(local)?)?;
-        let current_remote: BTreeMap<String, String> =
+        let current_local = cached_inventory(local, Some(&value.local_inventory))?;
+        let current_remote: Inventory =
             transport.remote_request(&RemoteRequest::OpenCodeInventory {
                 root: remote.to_owned(),
+                resources: options.resources,
+                peer_id: value.local_node_id.clone(),
+                previous: Some(value.remote_inventory.clone()),
             })?;
-        if fingerprint(&current_local)? != value.local_fingerprint {
+        if inventory_fingerprint(&current_local) != inventory_fingerprint(&value.local_inventory) {
             bail!("local OpenCode sessions changed after preview");
         }
-        if current_remote != value.remote_fingerprint {
+        if inventory_fingerprint(&current_remote) != inventory_fingerprint(&value.remote_inventory)
+        {
             bail!("remote OpenCode sessions changed after preview");
         }
         let remote_writers: OpenCodeWritersResult =
@@ -806,20 +919,6 @@ impl Adapter for OpenCodeAdapter {
             bail!("a remote OpenCode writer became active");
         }
 
-        let expected = value
-            .stage
-            .join("sessions")
-            .read_dir()?
-            .map(|entry| {
-                let path = entry?.path();
-                let id = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .context("invalid staged OpenCode filename")?
-                    .to_owned();
-                Ok((id.clone(), SessionExport::parse(&fs::read(path)?, &id)?))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
         let backup_stamp = stamp();
         let local_backup = local_backup(local, &backup_stamp)?;
         let remote_backup: OpenCodeBackupResult =
@@ -827,17 +926,14 @@ impl Adapter for OpenCodeAdapter {
                 root: remote.to_owned(),
                 stamp: backup_stamp,
             })?;
-        let expected_fingerprint = fingerprint(&expected)?;
-        let local_generation = bytes_sha256(&serde_json::to_vec(&value.local_fingerprint)?);
-        let remote_generation = bytes_sha256(&serde_json::to_vec(&value.remote_fingerprint)?);
         let mut journal = crate::state::TransactionJournal::new(
             "opencode",
             options.resources,
             &value.local_node_id,
             &value.remote_node_id,
-            &local_generation,
-            &remote_generation,
-            &bytes_sha256(&serde_json::to_vec(&expected_fingerprint)?),
+            &value.local_inventory.generation,
+            &value.remote_inventory.generation,
+            &bytes_sha256(&serde_json::to_vec(&value.result_fingerprint)?),
             &local_backup,
             &remote_backup.path,
         );
@@ -858,29 +954,42 @@ impl Adapter for OpenCodeAdapter {
         }
         journal.phase = crate::state::TransactionPhase::RemoteApplied;
         transport.save_transaction_pair(&value.state_root, &journal)?;
-        let verified_local = export_local(&local_session_ids(local)?)?;
-        let verified_remote: BTreeMap<String, String> =
+        let verified_local = cached_inventory(local, Some(&value.local_inventory))?;
+        let verified_remote: Inventory =
             transport.remote_request(&RemoteRequest::OpenCodeInventory {
                 root: remote.to_owned(),
+                resources: options.resources,
+                peer_id: value.local_node_id.clone(),
+                previous: Some(value.remote_inventory.clone()),
             })?;
-        for (id, expected_session) in expected {
-            let expected_hash = expected_session.canonical_hash()?;
-            let local_hash = verified_local
-                .get(&id)
-                .with_context(|| format!("local omitted OpenCode session {id}"))?
-                .canonical_hash()?;
-            if local_hash != expected_hash {
-                bail!("local OpenCode session differs after import: {id}");
-            }
-            let remote_hash = verified_remote
-                .get(&id)
-                .with_context(|| format!("remote omitted OpenCode session {id}"))?;
-            if remote_hash != &expected_hash {
-                bail!("remote OpenCode session differs after import: {id}");
-            }
+        let verified_local_fingerprint = inventory_fingerprint(&verified_local);
+        let verified_remote_fingerprint = inventory_fingerprint(&verified_remote);
+        if verified_local_fingerprint != value.result_fingerprint {
+            bail!("local OpenCode sessions differ after import");
+        }
+        if verified_remote_fingerprint != value.result_fingerprint {
+            bail!("remote OpenCode sessions differ after import");
         }
         journal.phase = crate::state::TransactionPhase::Verified;
         transport.save_transaction_pair(&value.state_root, &journal)?;
+        let local_checkpoint = crate::state::Checkpoint::new(
+            "opencode",
+            options.resources,
+            &transport.host,
+            verified_local,
+        );
+        let mut remote_checkpoint = local_checkpoint.clone();
+        remote_checkpoint.peer = value.local_node_id.clone();
+        remote_checkpoint.inventory = verified_remote;
+        remote_checkpoint.result_content_hash =
+            crate::state::content_hash(&remote_checkpoint.inventory);
+        if remote_checkpoint.result_content_hash != local_checkpoint.result_content_hash {
+            bail!("cannot checkpoint divergent OpenCode results");
+        }
+        let _: Value = transport.remote_request(&RemoteRequest::SaveCheckpoint {
+            checkpoint: remote_checkpoint,
+        })?;
+        crate::state::save(&value.state_root, &local_checkpoint)?;
         transport.clear_transaction_pair(&value.state_root, &journal)?;
         println!(
             "complete: OpenCode sessions synchronized and verified; backups: local={}, remote={}:{}",
@@ -928,6 +1037,46 @@ mod tests {
             id,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unchanged_sqlite_revision_reuses_checkpoint_hash_without_export() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+                 CREATE TABLE message (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     time_updated INTEGER NOT NULL
+                 );
+                 CREATE TABLE part (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     time_updated INTEGER NOT NULL
+                 );
+                 INSERT INTO session VALUES ('ses_cached', 10);
+                 INSERT INTO message VALUES ('msg_cached', 'ses_cached', 20);
+                 INSERT INTO part VALUES ('prt_cached', 'ses_cached', 30);",
+            )
+            .unwrap();
+        drop(connection);
+        let previous = Inventory::new(
+            vec![InventoryEntry {
+                path: "sessions/ses_cached.json".into(),
+                sha256: "cached-hash".into(),
+                size: (1_u64 << 32) | 1,
+                modified_ns: 30,
+            }],
+            0,
+        );
+
+        let inventory = cached_inventory(temp.path(), Some(&previous)).unwrap();
+
+        assert_eq!(inventory.reused_entries, 1);
+        assert_eq!(inventory.entries[0].sha256, "cached-hash");
     }
 
     #[test]

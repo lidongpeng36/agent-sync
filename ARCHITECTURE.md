@@ -61,6 +61,11 @@ persistent full-content remote snapshot is required. Successful applies write
 small per-peer checkpoints on both endpoints; exact size/mtime matches reuse
 previous hashes while missing or invalid state safely falls back to hashing.
 
+OpenCode uses the same checkpoint envelope with a session revision composed of
+the maximum session/message/part update time and their row counts. It exports
+only revisions whose canonical semantic hash cannot be reused, and omits equal
+sessions from temporary snapshots and the apply stage.
+
 Remote scans and applies share a stable per-agent kernel lock. Apply acquires
 both endpoint locks in node-ID order, then revalidates the prepared generation.
 This serializes mini I/O and writes across multiple peers without holding locks

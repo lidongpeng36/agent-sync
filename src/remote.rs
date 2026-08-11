@@ -1,4 +1,4 @@
-use crate::core::{ResourceSelection, file_lock_is_held, inventory_cached};
+use crate::core::{Inventory, ResourceSelection, file_lock_is_held, inventory_cached};
 use crate::state::{Checkpoint, TransactionJournal};
 use anyhow::{Context, Result, bail};
 use filetime::FileTime;
@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -66,6 +66,10 @@ pub enum Request {
     },
     OpenCodeInventory {
         root: String,
+        resources: ResourceSelection,
+        peer_id: String,
+        #[serde(default)]
+        previous: Option<Inventory>,
     },
     OpenCodeExports {
         ids: Vec<String>,
@@ -292,9 +296,21 @@ fn dispatch(request: Request) -> Result<Value> {
         Request::CodexActiveWriters { root } => Ok(serde_json::to_value(codex_active_writers(
             &expand_root(&root)?,
         )?)?),
-        Request::OpenCodeInventory { root } => Ok(serde_json::to_value(opencode_inventory(
-            &expand_root(&root)?,
-        )?)?),
+        Request::OpenCodeInventory {
+            root,
+            resources,
+            peer_id,
+            previous,
+        } => {
+            let state_root = crate::state::default_state_root()?;
+            let checkpoint = crate::state::load(&state_root, "opencode", &peer_id, resources)?;
+            Ok(serde_json::to_value(opencode_inventory(
+                &expand_root(&root)?,
+                previous
+                    .as_ref()
+                    .or_else(|| checkpoint.as_ref().map(|value| &value.inventory)),
+            )?)?)
+        }
         Request::OpenCodeExports { ids } => Ok(serde_json::to_value(opencode_exports(&ids)?)?),
         Request::OpenCodeWriters { root } => Ok(serde_json::json!({
             "active": sqlite_writers(&expand_root(&root)?.join("opencode.db"))?,
@@ -537,18 +553,6 @@ fn codex_active_writers(root: &Path) -> Result<Vec<String>> {
     Ok(active)
 }
 
-fn opencode_session_ids(root: &Path) -> Result<Vec<String>> {
-    let connection = Connection::open_with_flags(
-        root.join("opencode.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let mut statement = connection.prepare("SELECT id FROM session ORDER BY id")?;
-    let ids = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(ids)
-}
-
 fn valid_opencode_session_id(id: &str) -> bool {
     id.starts_with("ses_")
         && id.chars().all(|character| {
@@ -583,11 +587,8 @@ fn opencode_exports(ids: &[String]) -> Result<BTreeMap<String, Value>> {
     Ok(exports)
 }
 
-fn opencode_inventory(root: &Path) -> Result<BTreeMap<String, String>> {
-    opencode_exports(&opencode_session_ids(root)?)?
-        .into_iter()
-        .map(|(id, value)| Ok((id, crate::adapters::opencode::canonical_hash_value(&value)?)))
-        .collect()
+fn opencode_inventory(root: &Path, previous: Option<&Inventory>) -> Result<Inventory> {
+    crate::adapters::opencode::cached_inventory(root, previous)
 }
 
 fn sqlite_writers(database: &Path) -> Result<bool> {

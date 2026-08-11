@@ -60,14 +60,14 @@ fn help_documents_read_only_default() {
 fn remote_helper_negotiates_the_typed_protocol() {
     let output = Command::cargo_bin("agent-sync")
         .unwrap()
-        .args(["__remote", "--protocol", "2"])
+        .args(["__remote", "--protocol", "3"])
         .write_stdin("{\"op\":\"ping\"}\n")
         .output()
         .unwrap();
     assert!(output.status.success());
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["protocol"], 2);
+    assert_eq!(response["protocol"], 3);
     assert_eq!(response["ok"], true);
-    assert_eq!(response["value"]["protocol"], 2);
+    assert_eq!(response["value"]["protocol"], 3);
     assert!(response["value"]["executable_sha256"].as_str().is_some());
 }
