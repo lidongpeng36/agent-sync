@@ -130,7 +130,7 @@ fn parse_stability(value: &str) -> Result<f64, String> {
 #[derive(Serialize)]
 struct AdapterInfo<'a> {
     name: &'a str,
-    resources: [&'a str; 2],
+    resources: &'a [&'a str],
 }
 
 fn resolve_target(
@@ -198,11 +198,15 @@ fn run() -> Result<i32> {
             let values = [
                 AdapterInfo {
                     name: "codex",
-                    resources: ["sessions", "memory"],
+                    resources: &["sessions", "memory"],
                 },
                 AdapterInfo {
                     name: "claude",
-                    resources: ["sessions", "memory"],
+                    resources: &["sessions", "memory"],
+                },
+                AdapterInfo {
+                    name: "opencode",
+                    resources: &["sessions"],
                 },
             ];
             println!("{}", serde_json::to_string_pretty(&values)?);

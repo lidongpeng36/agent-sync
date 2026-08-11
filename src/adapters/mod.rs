@@ -1,5 +1,6 @@
 mod claude;
 mod codex;
+mod opencode;
 
 use crate::core::{OutputFormat, PlanReport, SyncOptions};
 use crate::transport::SshTransport;
@@ -10,11 +11,13 @@ use std::path::Path;
 
 pub use claude::ClaudePrepared;
 pub use codex::CodexPrepared;
+pub use opencode::OpenCodePrepared;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AgentKind {
     Codex,
     Claude,
+    Opencode,
 }
 
 impl fmt::Display for AgentKind {
@@ -22,6 +25,7 @@ impl fmt::Display for AgentKind {
         f.write_str(match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Opencode => "opencode",
         })
     }
 }
@@ -29,6 +33,7 @@ impl fmt::Display for AgentKind {
 pub enum Prepared {
     Claude(ClaudePrepared),
     Codex(CodexPrepared),
+    OpenCode(OpenCodePrepared),
 }
 
 impl Prepared {
@@ -36,12 +41,14 @@ impl Prepared {
         match self {
             Self::Claude(v) => &v.report,
             Self::Codex(v) => &v.report,
+            Self::OpenCode(v) => &v.report,
         }
     }
     pub fn print(&self, output: OutputFormat, local_root: &Path) -> Result<()> {
         match (self, output) {
             (Self::Claude(value), OutputFormat::Diff) => claude::print_diff(value, local_root),
             (Self::Codex(value), OutputFormat::Diff) => codex::print_diff(value, local_root),
+            (Self::OpenCode(value), OutputFormat::Diff) => opencode::print_diff(value, local_root),
             _ => self.report().print(output),
         }
     }
@@ -72,10 +79,12 @@ pub trait Adapter {
 
 static CLAUDE: claude::ClaudeAdapter = claude::ClaudeAdapter;
 static CODEX: codex::CodexAdapter = codex::CodexAdapter;
+static OPENCODE: opencode::OpenCodeAdapter = opencode::OpenCodeAdapter;
 
 pub fn adapter_for(kind: AgentKind) -> &'static dyn Adapter {
     match kind {
         AgentKind::Claude => &CLAUDE,
         AgentKind::Codex => &CODEX,
+        AgentKind::Opencode => &OPENCODE,
     }
 }

@@ -381,7 +381,7 @@ fn resource_name(path: &str) -> &'static str {
     }
 }
 
-fn shorten_middle(value: &str, maximum: usize) -> String {
+pub fn shorten_middle(value: &str, maximum: usize) -> String {
     if UnicodeWidthStr::width(value) <= maximum {
         return value.to_owned();
     }

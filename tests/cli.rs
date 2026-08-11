@@ -10,7 +10,8 @@ fn lists_built_in_adapters() {
         .assert()
         .success()
         .stdout(predicate::str::contains("codex"))
-        .stdout(predicate::str::contains("claude"));
+        .stdout(predicate::str::contains("claude"))
+        .stdout(predicate::str::contains("opencode"));
 }
 
 #[test]

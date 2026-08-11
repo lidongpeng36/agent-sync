@@ -45,6 +45,30 @@ impl SshTransport {
         Ok(output)
     }
 
+    pub fn ssh_with_input(&self, script: &str, input: &[u8]) -> Result<Output> {
+        let mut child = Command::new(&self.ssh)
+            .arg(&self.host)
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {} {}", self.ssh, self.host))?;
+        child
+            .stdin
+            .take()
+            .context("remote command stdin")?
+            .write_all(input)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "remote command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(output)
+    }
+
     pub fn pull(&self, remote_root: &str, local: &Path, filters: &[&str]) -> Result<()> {
         private_dir(local)?;
         let mut command = Command::new(&self.rsync);

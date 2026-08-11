@@ -95,6 +95,7 @@ impl Config {
         let default_local = match kind {
             AgentKind::Codex => home.join(".codex"),
             AgentKind::Claude => home.join(".claude"),
+            AgentKind::Opencode => home.join(".local/share/opencode"),
         };
         let configured = self
             .agents
@@ -109,6 +110,7 @@ impl Config {
         let default_remote = match kind {
             AgentKind::Codex => ".codex",
             AgentKind::Claude => ".claude",
+            AgentKind::Opencode => ".local/share/opencode",
         };
         let remote_root = remote
             .map(str::to_owned)

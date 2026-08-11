@@ -9,6 +9,8 @@ Built-in adapters:
 
 - **Codex**: rollouts, archives, history/index, catalog timestamps, and memory.
 - **Claude Code**: sessions, subagents, tool results, and project memory.
+- **OpenCode**: portable session exports, linear advances, and deterministic
+  forks. Credentials and the rest of `opencode.db` are never transferred.
 
 The default mode is a read-only preview. No credentials, settings, plugins,
 caches, lock files, or SQLite databases are copied between machines.
@@ -34,15 +36,17 @@ cd agent-sync
 cargo install --path . --locked
 ```
 
-`ssh` and `rsync` must be available locally. Claude writer detection also uses
-`lsof` on both peers, while Codex catalog repair uses `codex app-server` on both
-peers.
+`ssh` and `rsync` must be available locally. Claude and OpenCode writer
+detection also use `lsof` on both peers. Codex catalog repair uses
+`codex app-server`, and OpenCode synchronization uses the `opencode` CLI, on
+both peers.
 
 ## Usage
 
 ```console
 agent-sync sync codex mini
 agent-sync sync claude mini --only sessions
+agent-sync sync opencode mini
 agent-sync sync claude mini -s ask
 agent-sync s claude -f diff > claude-sync.diff
 agent-sync sync codex mini --only memory --apply
@@ -109,9 +113,13 @@ local_root = "~/.claude"
 # Optional agent-specific override:
 # conflict_strategy = "local"
 
+[agents.opencode]
+local_root = "~/.local/share/opencode"
+
 [peers.mini.roots]
 codex = ".codex"
 claude = ".claude"
+opencode = ".local/share/opencode"
 ```
 
 Conflict-strategy precedence is CLI, agent-specific configuration, global
@@ -142,6 +150,12 @@ retain non-empty `name` and `description` frontmatter, and the index entry must
 link to the memory file exactly once. Real local and remote files remain
 unchanged until the resolved plan is shown and `[Y/n]` is confirmed.
 
+OpenCode currently synchronizes sessions only. It reads and writes sessions
+through the official `opencode export` and `opencode import` commands instead
+of copying the database. Linear histories take the longer version; true
+divergences are retained under a deterministic fork ID so multi-machine syncs
+converge. Conflict strategy does not apply to OpenCode sessions.
+
 ## Safety model
 
 - Remote reads use an explicit rsync allowlist.
@@ -153,6 +167,8 @@ unchanged until the resolved plan is shown and `[Y/n]` is confirmed.
   through the file transaction.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
+- OpenCode backups remain on their originating machine, and account,
+  credential, permission, and authentication tables are never transferred.
 - Session mtimes come from the last event rather than transfer time.
 - Remote filesystem, lock, backup, mtime, and SQLite operations use a versioned
   typed protocol implemented by the same Rust binary; no Python source is sent
@@ -165,11 +181,12 @@ with private permissions below
 `~/.cache/agent-sync/remotes/<version>/agent-sync`; bootstrapping currently
 requires the peer to have the same OS and CPU architecture as the local binary.
 
-Runtime dependencies are `ssh` and `rsync` locally. Claude writer detection
-also needs `lsof` on both machines, and Codex catalog repair needs a compatible
-`codex app-server` on both machines. Backup creation, timestamp handling,
-locking, and SQLite maintenance are implemented in Rust and do not require
-`tar` or `python3`.
+Runtime dependencies are `ssh` and `rsync` locally. Claude and OpenCode writer
+detection also need `lsof` on both machines. Codex catalog repair needs a
+compatible `codex app-server`, and OpenCode synchronization needs a compatible
+`opencode` CLI, on both machines. Backup creation, timestamp handling, locking,
+and SQLite maintenance are implemented in Rust and do not require `tar` or
+`python3`.
 
 ## Development
 
@@ -198,6 +215,7 @@ cargo install agent-sync --locked
 ```console
 agent-sync sync codex mini
 agent-sync sync claude mini --only memory
+agent-sync sync opencode mini
 ```
 
 可以在配置顶层设置 `default_peer = "mini"`，之后简写为
@@ -210,6 +228,8 @@ agent-sync sync claude mini --only memory
 线性 session 取更长版本，真实分叉始终保留为两个 UUID，独立的 Markdown
 标题块自动合并；仅无法无损合并的 memory block 或索引描述需要选择
 `local`、`remote` 或通过 `$EDITOR` 编辑。旧值 `merge` 兼容映射为 `ask`。
+OpenCode 当前只同步 session，通过官方 `export`/`import` 接口工作，不复制
+包含凭据的数据库；线性历史取较长版本，真实分叉使用确定性 ID 分别保留。
 
 ## License
 

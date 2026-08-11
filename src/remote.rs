@@ -36,6 +36,16 @@ pub enum Request {
     CodexActiveWriters {
         root: String,
     },
+    OpenCodeSessionIds {
+        root: String,
+    },
+    OpenCodeWriters {
+        root: String,
+    },
+    OpenCodeBackup {
+        root: String,
+        stamp: String,
+    },
     HoldCoordinationLock {
         root: String,
     },
@@ -143,6 +153,28 @@ fn dispatch(request: Request) -> Result<Value> {
                 "claude" if Command::new("lsof").arg("-v").output().is_err() => {
                     bail!("remote lsof command is missing")
                 }
+                "opencode" if Command::new("opencode").arg("--version").output().is_err() => {
+                    bail!("remote opencode command is missing")
+                }
+                "opencode" if Command::new("lsof").arg("-v").output().is_err() => {
+                    bail!("remote lsof command is missing")
+                }
+                "opencode" => {
+                    let output = Command::new("opencode").args(["db", "path"]).output()?;
+                    if !output.status.success() {
+                        bail!("remote `opencode db path` failed");
+                    }
+                    let reported = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+                    let configured = fs::canonicalize(root.join("opencode.db"))?;
+                    let reported = fs::canonicalize(reported)?;
+                    if reported != configured {
+                        bail!(
+                            "remote OpenCode root differs from `opencode db path`: configured={}, reported={}",
+                            configured.display(),
+                            reported.display()
+                        );
+                    }
+                }
                 "codex" | "claude" => {}
                 _ => bail!("unknown agent: {agent}"),
             }
@@ -165,6 +197,15 @@ fn dispatch(request: Request) -> Result<Value> {
         Request::CodexActiveWriters { root } => Ok(serde_json::to_value(codex_active_writers(
             &expand_root(&root)?,
         )?)?),
+        Request::OpenCodeSessionIds { root } => Ok(serde_json::to_value(opencode_session_ids(
+            &expand_root(&root)?,
+        )?)?),
+        Request::OpenCodeWriters { root } => Ok(serde_json::json!({
+            "active": sqlite_writers(&expand_root(&root)?.join("opencode.db"))?,
+        })),
+        Request::OpenCodeBackup { root, stamp } => Ok(serde_json::json!({
+            "path": opencode_backup(&expand_root(&root)?, &stamp)?,
+        })),
         Request::HoldCoordinationLock { root } => {
             let root = expand_root(&root)?;
             let path = root.join("thread-writer-locks/.coordination.lock");
@@ -353,6 +394,53 @@ fn codex_active_writers(root: &Path) -> Result<Vec<String>> {
     }
     active.sort();
     Ok(active)
+}
+
+fn opencode_session_ids(root: &Path) -> Result<Vec<String>> {
+    let connection = Connection::open_with_flags(
+        root.join("opencode.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut statement = connection.prepare("SELECT id FROM session ORDER BY id")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+fn sqlite_writers(database: &Path) -> Result<bool> {
+    let output = Command::new("lsof")
+        .args(["-Fpf"])
+        .arg(database)
+        .output()
+        .context("run lsof for OpenCode database")?;
+    let mut current = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.starts_with('p') {
+            current = true;
+        } else if current
+            && line.starts_with('f')
+            && line[1..].chars().take_while(char::is_ascii_digit).count() > 0
+            && line
+                .chars()
+                .any(|character| character == 'w' || character == 'u')
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn opencode_backup(root: &Path, stamp: &str) -> Result<String> {
+    let directory = root.join("agent-sync-backups");
+    private_dir(&directory)?;
+    let destination = directory.join(format!("before-{stamp}.db"));
+    let connection = Connection::open(root.join("opencode.db"))?;
+    connection.execute(
+        "VACUUM INTO ?1",
+        params![destination.to_string_lossy().as_ref()],
+    )?;
+    Ok(destination.to_string_lossy().into_owned())
 }
 
 pub fn create_backup(root: &Path, out: &Path, members: &[String]) -> Result<()> {
