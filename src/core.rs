@@ -216,6 +216,23 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    pub fn new(entries: Vec<InventoryEntry>, reused_entries: usize) -> Self {
+        let mut digest = Sha256::new();
+        for entry in &entries {
+            digest.update(&entry.path);
+            digest.update([0]);
+            digest.update(&entry.sha256);
+            digest.update([0]);
+            digest.update(entry.size.to_le_bytes());
+            digest.update(entry.modified_ns.to_le_bytes());
+        }
+        Self {
+            generation: hex::encode(digest.finalize()),
+            entries,
+            reused_entries,
+        }
+    }
+
     pub fn by_path(&self) -> BTreeMap<&str, &InventoryEntry> {
         self.entries
             .iter()
@@ -246,6 +263,12 @@ pub enum FileAction {
     Replace,
     Remove,
     Metadata,
+}
+
+#[derive(Clone, Copy)]
+pub enum PayloadSide {
+    Local,
+    Remote,
 }
 
 impl fmt::Display for FileAction {
@@ -975,23 +998,7 @@ pub fn inventory_cached(
             });
         }
     }
-    let mut digest = Sha256::new();
-    for entry in &entries {
-        digest.update(&entry.path);
-        digest.update([0]);
-        digest.update(&entry.sha256);
-        digest.update([0]);
-        digest.update(entry.size.to_le_bytes());
-        digest.update(entry.modified_ns.to_le_bytes());
-    }
-    Ok((
-        Inventory {
-            generation: hex::encode(digest.finalize()),
-            entries,
-            reused_entries: reused,
-        },
-        reused,
-    ))
+    Ok((Inventory::new(entries, reused), reused))
 }
 
 pub fn inventory_transfer_paths(local: &Inventory, remote: &Inventory) -> Vec<String> {
@@ -1006,6 +1013,34 @@ pub fn inventory_transfer_paths(local: &Inventory, remote: &Inventory) -> Vec<St
         .filter(|entry| !local_hashes.contains(entry.sha256.as_str()))
         .map(|entry| entry.path.clone())
         .collect()
+}
+
+pub fn seed_remote_deltas(
+    local_root: &Path,
+    local: &Inventory,
+    remote_view: &Path,
+    remote: &Inventory,
+    transfer_paths: &[String],
+) -> Result<usize> {
+    let local = local.by_path();
+    let remote = remote.by_path();
+    let mut seeded = 0;
+    for path in transfer_paths {
+        let Some(local_entry) = local.get(path.as_str()) else {
+            continue;
+        };
+        let Some(remote_entry) = remote.get(path.as_str()) else {
+            continue;
+        };
+        if local_entry.sha256 == remote_entry.sha256 {
+            continue;
+        }
+        let destination = remote_view.join(path);
+        private_dir(destination.parent().context("delta path has no parent")?)?;
+        fs::copy(local_root.join(path), destination)?;
+        seeded += 1;
+    }
+    Ok(seeded)
 }
 
 pub fn complete_remote_view(
@@ -1080,6 +1115,41 @@ pub fn copy_file_atomic(source: &Path, destination: &Path) -> Result<()> {
     fs::copy(source, &temp)?;
     fs::rename(&temp, destination)?;
     Ok(())
+}
+
+pub fn build_sparse_payload(
+    result: &Path,
+    destination: &Path,
+    files: &[FileChange],
+    side: PayloadSide,
+) -> Result<usize> {
+    private_dir(destination)?;
+    let mut count = 0;
+    for file in files {
+        let action = match side {
+            PayloadSide::Local => file.local,
+            PayloadSide::Remote => file.remote,
+        };
+        match action {
+            FileAction::Unchanged => continue,
+            FileAction::Remove => {
+                bail!(
+                    "sparse payload cannot represent removal safely yet: {}",
+                    file.path
+                )
+            }
+            FileAction::Create | FileAction::Replace | FileAction::Metadata => {}
+        }
+        let relative = Path::new(&file.path);
+        safe_relative(relative)?;
+        let source = result.join(relative);
+        if !source.is_file() {
+            bail!("staged payload source is missing: {}", source.display());
+        }
+        copy_file_atomic(&source, &destination.join(relative))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -1295,5 +1365,80 @@ mod tests {
         assert!(inventory_transfer_paths(&second, &remote).is_empty());
         complete_remote_view(&local, &second, &view, &remote).unwrap();
         assert_eq!(fs::read(view.join("remote-name.jsonl")).unwrap(), b"same\n");
+    }
+
+    #[test]
+    fn differing_same_path_is_seeded_for_rsync_delta_transfer() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let view = temp.path().join("view");
+        private_dir(&local).unwrap();
+        private_dir(&view).unwrap();
+        fs::write(local.join("session.jsonl"), "prefix\n").unwrap();
+        let local_inventory = inventory(&local, |_| false).unwrap();
+        let remote_inventory = Inventory {
+            generation: "remote".into(),
+            entries: vec![InventoryEntry {
+                path: "session.jsonl".into(),
+                sha256: "different".into(),
+                size: 20,
+                modified_ns: 10,
+            }],
+            reused_entries: 0,
+        };
+        let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
+        assert_eq!(transfer, ["session.jsonl"]);
+        assert_eq!(
+            seed_remote_deltas(
+                &local,
+                &local_inventory,
+                &view,
+                &remote_inventory,
+                &transfer
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(fs::read(view.join("session.jsonl")).unwrap(), b"prefix\n");
+    }
+
+    #[test]
+    fn sparse_payload_contains_only_files_changed_on_selected_side() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = temp.path().join("result");
+        let local_payload = temp.path().join("local-payload");
+        private_dir(&result).unwrap();
+        fs::write(result.join("local.jsonl"), "local\n").unwrap();
+        fs::write(result.join("remote.jsonl"), "remote\n").unwrap();
+        let files = vec![
+            FileChange {
+                resource: "sessions".into(),
+                path: "local.jsonl".into(),
+                display_path: "local.jsonl".into(),
+                local: FileAction::Create,
+                remote: FileAction::Unchanged,
+                resolution: "local".into(),
+                local_sha256: None,
+                remote_sha256: None,
+                result_sha256: None,
+            },
+            FileChange {
+                resource: "sessions".into(),
+                path: "remote.jsonl".into(),
+                display_path: "remote.jsonl".into(),
+                local: FileAction::Unchanged,
+                remote: FileAction::Create,
+                resolution: "remote".into(),
+                local_sha256: None,
+                remote_sha256: None,
+                result_sha256: None,
+            },
+        ];
+        assert_eq!(
+            build_sparse_payload(&result, &local_payload, &files, PayloadSide::Local).unwrap(),
+            1
+        );
+        assert!(local_payload.join("local.jsonl").is_file());
+        assert!(!local_payload.join("remote.jsonl").exists());
     }
 }

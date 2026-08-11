@@ -1,9 +1,10 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PlanReport, ResourceSelection,
-    SyncOptions, bytes_sha256, choose_interactively, complete_remote_view, edit_conflict_documents,
-    file_lock_is_held, inventory, inventory_cached, inventory_transfer_paths, manifest,
-    planned_file_changes, print_planned_diff, private_dir, stamp,
+    Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PayloadSide, PlanReport,
+    ResourceSelection, SyncOptions, build_sparse_payload, bytes_sha256, choose_interactively,
+    complete_remote_view, edit_conflict_documents, file_lock_is_held, inventory, inventory_cached,
+    inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
+    seed_remote_deltas, stamp,
 };
 use crate::remote::{Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
@@ -141,7 +142,14 @@ impl Adapter for CodexAdapter {
                 peer_id: local_node_id.clone(),
             })?;
         let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
-        transport.pull_files(remote_root, &remote, &transfer)?;
+        let seeded = seed_remote_deltas(
+            local,
+            &local_inventory,
+            &remote,
+            &remote_inventory,
+            &transfer,
+        )?;
+        let transfer_stats = transport.pull_files(remote_root, &remote, &transfer)?;
         complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
         drop(scan_guard);
         let (mut report, metadata, conflicts) = build_stage(
@@ -166,6 +174,13 @@ impl Adapter for CodexAdapter {
             remote_inventory.entries.len(),
             transfer.len(),
             transferred_bytes
+        ));
+        report.notes.push(format!(
+            "rsync delta: bases={seeded}; wire sent/received={}/{} bytes; literal/matched={}/{} bytes",
+            transfer_stats.wire_sent.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            transfer_stats.wire_received.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            transfer_stats.literal_data.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            transfer_stats.matched_data.map_or_else(|| "unknown".into(), |value| value.to_string()),
         ));
         report.files = planned_file_changes(local, &remote, &stage, |path| {
             excluded(path, options.resources) || active_excluded_path(path, &active)
@@ -270,6 +285,7 @@ impl Adapter for CodexAdapter {
             "codex",
             value.resources,
         )?;
+        transport.ensure_no_pending_transaction(&value.state_root, "codex")?;
         let _guard = if value.resources.sessions() {
             Some(CodexGuards::acquire(local, remote_root, transport)?)
         } else {
@@ -306,6 +322,20 @@ impl Adapter for CodexAdapter {
             reconcile_catalog(None, false)?;
             reconcile_catalog(Some(transport), false)?;
         }
+        let local_payload = value.temp.path().join("local-payload");
+        let remote_payload = value.temp.path().join("remote-payload");
+        let local_payload_count = build_sparse_payload(
+            &value.stage,
+            &local_payload,
+            &value.report.files,
+            PayloadSide::Local,
+        )?;
+        let remote_payload_count = build_sparse_payload(
+            &value.stage,
+            &remote_payload,
+            &value.report.files,
+            PayloadSide::Remote,
+        )?;
         let stamp = stamp();
         let local_backup = backup_local(local, value.resources, &stamp)?;
         let remote_backup = backup_remote(remote_root, value.resources, &stamp, transport)?;
@@ -313,8 +343,25 @@ impl Adapter for CodexAdapter {
             backup_state(local, &stamp)?;
             remote_state(transport, remote_root, &stamp, "backup", None)?;
         }
-        install_local(&value.stage, local, &transport.rsync)?;
-        transport.push(&value.stage, remote_root)?;
+        let result_inventory = inventory(&value.stage, exclude)?;
+        let mut journal = crate::state::TransactionJournal::new(
+            "codex",
+            value.resources,
+            &value.local_node_id,
+            &value.remote_node_id,
+            &value.local_fingerprint,
+            &value.remote_fingerprint,
+            &crate::state::content_hash(&result_inventory),
+            &local_backup,
+            &remote_backup,
+        );
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        install_local(&local_payload, local, &transport.rsync)?;
+        journal.phase = crate::state::TransactionPhase::LocalApplied;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        transport.push(&remote_payload, remote_root)?;
+        journal.phase = crate::state::TransactionPhase::RemoteApplied;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
         verify_selected(&value.stage, local, value.resources, &value.active, "local")?;
         let verified_remote: crate::core::Inventory =
             transport.remote_request(&RemoteRequest::Inventory {
@@ -330,6 +377,8 @@ impl Adapter for CodexAdapter {
             value.resources,
             &value.active,
         )?;
+        journal.phase = crate::state::TransactionPhase::Verified;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
         drop(_guard);
         if value.resources.sessions() && value.active.is_empty() {
             let local_count = reconcile_catalog(None, true)?;
@@ -371,8 +420,9 @@ impl Adapter for CodexAdapter {
             checkpoint: remote_checkpoint,
         })?;
         crate::state::save(&value.state_root, &local_checkpoint)?;
+        transport.clear_transaction_pair(&value.state_root, &journal)?;
         println!(
-            "complete: Codex synchronized and verified; backups: local={}, remote={}:{}",
+            "complete: Codex synchronized and verified; sparse payloads: local={local_payload_count}, remote={remote_payload_count}; backups: local={}, remote={}:{}",
             local_backup.display(),
             transport.host,
             remote_backup

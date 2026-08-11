@@ -81,7 +81,10 @@ OpenCode exchanges canonical session hashes in one helper request and batch
 exports only sessions whose semantic hash differs; it no longer opens one SSH
 connection per session.
 Manifest reports label selected payload sizes as `uncompressed bytes`; this is
-the logical source size before rsync compression, not measured SSH wire usage.
+the logical source size before rsync compression. `rsync delta` reports actual
+protocol bytes sent/received plus literal and locally matched data. Differing
+same-path files are seeded from the local copy and transferred with checksum
+verification, allowing rsync to send only changed blocks.
 
 The default resource set is `sessions` plus `memory`; select one with
 `--only sessions` or `--only memory`. Add `--format json` for machine-readable
@@ -228,6 +231,12 @@ converge. Conflict strategy does not apply to OpenCode sessions.
   after their manifest generation changes.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
+- Apply builds separate sparse payloads for each endpoint, so unchanged files
+  are not reinstalled or listed in the write transfer.
+- A durable transaction journal records prepared, local-applied,
+  remote-applied, and verified phases together with source generations and both
+  backup paths. Unfinished partial transactions block later writes; verified
+  journals left by a final cleanup failure are cleared automatically.
 - Repeated safety checks exchange manifests rather than downloading readback
   snapshots. Per-peer checkpoints are optional optimization state; missing or
   invalid state falls back to hashing and manifest exchange, not full transfer.

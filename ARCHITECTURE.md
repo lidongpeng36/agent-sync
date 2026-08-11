@@ -64,6 +64,14 @@ previous hashes while missing or invalid state safely falls back to hashing.
 Remote scans and applies share a stable per-agent kernel lock. Apply acquires
 both endpoint locks in node-ID order, then revalidates the prepared generation.
 This serializes mini I/O and writes across multiple peers without holding locks
-during interactive conflict editing. The next transport step is append-aware
-JSONL range transfer and a sparse operation journal, replacing the temporary
-materialized view while retaining the same manifest and locking protocol.
+during interactive conflict editing. A later transport step can add
+append-aware JSONL range transfer and automatic recovery of interrupted
+transactions while retaining the same manifest and locking protocol.
+
+Selective pulls seed same-path differences from the local file and invoke
+rsync with `--checksum`, compression, and statistics. This preserves content
+verification when size/mtime collide while reusing unchanged blocks. Apply
+derives endpoint-specific sparse payloads from the full result plan. Before the
+first write, both endpoints persist the same transaction ID, source
+generations, result hash, phase, and backup locations; each phase transition is
+durable, and later writes refuse to proceed over an unfinished partial commit.

@@ -775,6 +775,7 @@ impl Adapter for OpenCodeAdapter {
             "opencode",
             options.resources,
         )?;
+        transport.ensure_no_pending_transaction(&value.state_root, "opencode")?;
         let current_local = export_local(&local_session_ids(local)?)?;
         let current_remote: BTreeMap<String, String> =
             transport.remote_request(&RemoteRequest::OpenCodeInventory {
@@ -805,23 +806,6 @@ impl Adapter for OpenCodeAdapter {
             bail!("a remote OpenCode writer became active");
         }
 
-        let backup_stamp = stamp();
-        let local_backup = local_backup(local, &backup_stamp)?;
-        let remote_backup: OpenCodeBackupResult =
-            transport.remote_request(&RemoteRequest::OpenCodeBackup {
-                root: remote.to_owned(),
-                stamp: backup_stamp,
-            })?;
-        for file in &value.report.files {
-            let path = value.stage.join(&file.path);
-            if !matches!(file.local, FileAction::Unchanged) {
-                import_local(&path)?;
-            }
-            if !matches!(file.remote, FileAction::Unchanged) {
-                import_remote(&fs::read(&path)?, transport)?;
-            }
-        }
-
         let expected = value
             .stage
             .join("sessions")
@@ -836,6 +820,44 @@ impl Adapter for OpenCodeAdapter {
                 Ok((id.clone(), SessionExport::parse(&fs::read(path)?, &id)?))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let backup_stamp = stamp();
+        let local_backup = local_backup(local, &backup_stamp)?;
+        let remote_backup: OpenCodeBackupResult =
+            transport.remote_request(&RemoteRequest::OpenCodeBackup {
+                root: remote.to_owned(),
+                stamp: backup_stamp,
+            })?;
+        let expected_fingerprint = fingerprint(&expected)?;
+        let local_generation = bytes_sha256(&serde_json::to_vec(&value.local_fingerprint)?);
+        let remote_generation = bytes_sha256(&serde_json::to_vec(&value.remote_fingerprint)?);
+        let mut journal = crate::state::TransactionJournal::new(
+            "opencode",
+            options.resources,
+            &value.local_node_id,
+            &value.remote_node_id,
+            &local_generation,
+            &remote_generation,
+            &bytes_sha256(&serde_json::to_vec(&expected_fingerprint)?),
+            &local_backup,
+            &remote_backup.path,
+        );
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        for file in &value.report.files {
+            let path = value.stage.join(&file.path);
+            if !matches!(file.local, FileAction::Unchanged) {
+                import_local(&path)?;
+            }
+        }
+        journal.phase = crate::state::TransactionPhase::LocalApplied;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        for file in &value.report.files {
+            let path = value.stage.join(&file.path);
+            if !matches!(file.remote, FileAction::Unchanged) {
+                import_remote(&fs::read(&path)?, transport)?;
+            }
+        }
+        journal.phase = crate::state::TransactionPhase::RemoteApplied;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
         let verified_local = export_local(&local_session_ids(local)?)?;
         let verified_remote: BTreeMap<String, String> =
             transport.remote_request(&RemoteRequest::OpenCodeInventory {
@@ -857,6 +879,9 @@ impl Adapter for OpenCodeAdapter {
                 bail!("remote OpenCode session differs after import: {id}");
             }
         }
+        journal.phase = crate::state::TransactionPhase::Verified;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        transport.clear_transaction_pair(&value.state_root, &journal)?;
         println!(
             "complete: OpenCode sessions synchronized and verified; backups: local={}, remote={}:{}",
             local_backup.display(),

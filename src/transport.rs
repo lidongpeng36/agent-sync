@@ -8,6 +8,14 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferStats {
+    pub wire_sent: Option<u64>,
+    pub wire_received: Option<u64>,
+    pub literal_data: Option<u64>,
+    pub matched_data: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct SshTransport {
     pub host: String,
@@ -76,10 +84,20 @@ impl SshTransport {
         Ok(output)
     }
 
-    pub fn pull_files(&self, remote_root: &str, local: &Path, paths: &[String]) -> Result<()> {
+    pub fn pull_files(
+        &self,
+        remote_root: &str,
+        local: &Path,
+        paths: &[String],
+    ) -> Result<TransferStats> {
         private_dir(local)?;
         if paths.is_empty() {
-            return Ok(());
+            return Ok(TransferStats {
+                wire_sent: Some(0),
+                wire_received: Some(0),
+                literal_data: Some(0),
+                matched_data: Some(0),
+            });
         }
         let mut list = tempfile::NamedTempFile::new()?;
         for path in paths {
@@ -94,6 +112,8 @@ impl SshTransport {
         let mut command = Command::new(&self.rsync);
         self.configure_rsync(&mut command);
         command
+            .arg("--stats")
+            .arg("--checksum")
             .arg(format!("--files-from={}", list.path().display()))
             .args(["-e", &self.ssh])
             .arg(format!(
@@ -111,7 +131,9 @@ impl SshTransport {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(())
+        Ok(parse_transfer_stats(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 
     pub fn push(&self, source: &Path, remote_root: &str) -> Result<()> {
@@ -237,6 +259,82 @@ impl SshTransport {
         })
     }
 
+    pub fn ensure_no_pending_transaction(
+        &self,
+        local_state_root: &Path,
+        agent: &str,
+    ) -> Result<()> {
+        let local = crate::state::load_transaction(local_state_root, agent)?;
+        let remote: Option<crate::state::TransactionJournal> =
+            self.remote_request(&Request::GetTransaction {
+                agent: agent.to_owned(),
+            })?;
+        if local.is_none() && remote.is_none() {
+            return Ok(());
+        }
+        let ids = local
+            .iter()
+            .chain(remote.iter())
+            .map(|journal| journal.transaction_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let verified = local
+            .iter()
+            .chain(remote.iter())
+            .any(|journal| journal.phase == crate::state::TransactionPhase::Verified);
+        if ids.len() == 1 && verified {
+            let transaction_id = ids.into_iter().next().expect("transaction id exists");
+            let _: serde_json::Value = self.remote_request(&Request::ClearTransaction {
+                agent: agent.to_owned(),
+                transaction_id: transaction_id.to_owned(),
+            })?;
+            if local.is_some() {
+                crate::state::clear_transaction(local_state_root, agent, transaction_id)?;
+            }
+            return Ok(());
+        }
+        let describe = |journal: &crate::state::TransactionJournal| {
+            format!(
+                "id={}, phase={:?}, local_backup={}, remote_backup={}",
+                journal.transaction_id, journal.phase, journal.local_backup, journal.remote_backup
+            )
+        };
+        let detail = match (local.as_ref(), remote.as_ref()) {
+            (Some(local), Some(remote)) if local.transaction_id == remote.transaction_id => {
+                describe(local)
+            }
+            (Some(local), Some(remote)) => {
+                format!("local [{}]; remote [{}]", describe(local), describe(remote))
+            }
+            (Some(local), None) => format!("local [{}]; remote missing", describe(local)),
+            (None, Some(remote)) => format!("local missing; remote [{}]", describe(remote)),
+            (None, None) => unreachable!(),
+        };
+        bail!("unfinished {agent} sync transaction; recovery required before continuing: {detail}")
+    }
+
+    pub fn save_transaction_pair(
+        &self,
+        local_state_root: &Path,
+        journal: &crate::state::TransactionJournal,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.remote_request(&Request::PutTransaction {
+            journal: journal.clone(),
+        })?;
+        crate::state::save_transaction(local_state_root, journal)
+    }
+
+    pub fn clear_transaction_pair(
+        &self,
+        local_state_root: &Path,
+        journal: &crate::state::TransactionJournal,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.remote_request(&Request::ClearTransaction {
+            agent: journal.agent.clone(),
+            transaction_id: journal.transaction_id.clone(),
+        })?;
+        crate::state::clear_transaction(local_state_root, &journal.agent, &journal.transaction_id)
+    }
+
     fn raw_request<T: DeserializeOwned>(&self, path: &str, request: &Request) -> Result<T> {
         let mut child = self.spawn_helper(path)?;
         serde_json::to_writer(
@@ -337,6 +435,31 @@ impl SshTransport {
     }
 }
 
+fn parse_transfer_stats(output: &str) -> TransferStats {
+    let mut result = TransferStats::default();
+    for line in output.lines() {
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .chars()
+            .take_while(|character| character.is_ascii_digit() || *character == ',')
+            .filter(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u64>()
+            .ok();
+        match label.trim().to_ascii_lowercase().as_str() {
+            "total bytes sent" | "total sent" => result.wire_sent = value,
+            "total bytes received" | "total received" => result.wire_received = value,
+            "literal data" | "unmatched data" => result.literal_data = value,
+            "matched data" => result.matched_data = value,
+            _ => {}
+        }
+    }
+    result
+}
+
 pub struct RemoteGuard {
     child: Child,
 }
@@ -392,5 +515,16 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, ["-a", "--compress", "--bwlimit=12345"]);
+    }
+
+    #[test]
+    fn parses_rsync_wire_and_delta_statistics() {
+        let stats = parse_transfer_stats(
+            "Unmatched data: 1,024 B\nMatched data: 8,192 B\nTotal sent: 321 B\nTotal received: 654 B\n",
+        );
+        assert_eq!(stats.literal_data, Some(1_024));
+        assert_eq!(stats.matched_data, Some(8_192));
+        assert_eq!(stats.wire_sent, Some(321));
+        assert_eq!(stats.wire_received, Some(654));
     }
 }

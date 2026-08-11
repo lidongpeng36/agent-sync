@@ -1,5 +1,5 @@
 use crate::core::{ResourceSelection, file_lock_is_held, inventory_cached};
-use crate::state::Checkpoint;
+use crate::state::{Checkpoint, TransactionJournal};
 use anyhow::{Context, Result, bail};
 use filetime::FileTime;
 use fs2::FileExt;
@@ -35,6 +35,16 @@ pub enum Request {
     },
     SaveCheckpoint {
         checkpoint: Checkpoint,
+    },
+    GetTransaction {
+        agent: String,
+    },
+    PutTransaction {
+        journal: TransactionJournal,
+    },
+    ClearTransaction {
+        agent: String,
+        transaction_id: String,
     },
     HoldSyncLock {
         agent: String,
@@ -237,6 +247,24 @@ fn dispatch(request: Request) -> Result<Value> {
         Request::SaveCheckpoint { checkpoint } => {
             crate::state::save(&crate::state::default_state_root()?, &checkpoint)?;
             Ok(serde_json::json!({ "saved": true }))
+        }
+        Request::GetTransaction { agent } => Ok(serde_json::to_value(
+            crate::state::load_transaction(&crate::state::default_state_root()?, &agent)?,
+        )?),
+        Request::PutTransaction { journal } => {
+            crate::state::save_transaction(&crate::state::default_state_root()?, &journal)?;
+            Ok(serde_json::json!({ "saved": true }))
+        }
+        Request::ClearTransaction {
+            agent,
+            transaction_id,
+        } => {
+            crate::state::clear_transaction(
+                &crate::state::default_state_root()?,
+                &agent,
+                &transaction_id,
+            )?;
+            Ok(serde_json::json!({ "cleared": true }))
         }
         Request::HoldSyncLock { agent, resources } => {
             let guard = crate::state::acquire_sync_lock(

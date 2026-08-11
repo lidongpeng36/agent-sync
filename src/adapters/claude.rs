@@ -1,9 +1,10 @@
 use super::{Adapter, Prepared};
 use crate::core::{
-    Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PlanReport, ResourceSelection,
-    SyncOptions, bytes_sha256, choose_interactively, complete_remote_view, copy_file_atomic,
-    edit_conflict_documents, inventory, inventory_cached, inventory_transfer_paths, manifest,
-    planned_file_changes, print_planned_diff, private_dir, safe_relative, sha256, stamp,
+    Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PayloadSide, PlanReport,
+    ResourceSelection, SyncOptions, build_sparse_payload, bytes_sha256, choose_interactively,
+    complete_remote_view, copy_file_atomic, edit_conflict_documents, inventory, inventory_cached,
+    inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
+    safe_relative, seed_remote_deltas, sha256, stamp,
 };
 use crate::remote::{MtimeUpdate, Request as RemoteRequest, create_backup};
 use crate::transport::SshTransport;
@@ -212,7 +213,14 @@ impl Adapter for ClaudeAdapter {
                 peer_id: local_node_id.clone(),
             })?;
         let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
-        transport.pull_files(remote_root, &remote, &transfer)?;
+        let seeded = seed_remote_deltas(
+            local,
+            &local_inventory,
+            &remote,
+            &remote_inventory,
+            &transfer,
+        )?;
+        let transfer_stats = transport.pull_files(remote_root, &remote, &transfer)?;
         complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
         drop(scan_guard);
         let stage = temp.path().join("stage");
@@ -239,6 +247,13 @@ impl Adapter for ClaudeAdapter {
             remote_inventory.entries.len(),
             transfer.len(),
             transferred_bytes
+        ));
+        report.notes.push(format!(
+            "rsync delta: bases={seeded}; wire sent/received={}/{} bytes; literal/matched={}/{} bytes",
+            transfer_stats.wire_sent.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            transfer_stats.wire_received.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            transfer_stats.literal_data.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            transfer_stats.matched_data.map_or_else(|| "unknown".into(), |value| value.to_string()),
         ));
         Ok(Prepared::Claude(ClaudePrepared {
             report,
@@ -326,6 +341,7 @@ impl Adapter for ClaudeAdapter {
             "claude",
             value.resources,
         )?;
+        transport.ensure_no_pending_transaction(&value.state_root, "claude")?;
         if inventory(local, exclude)?.generation != value.local_fingerprint {
             bail!("local Claude data changed after preview");
         }
@@ -354,15 +370,48 @@ impl Adapter for ClaudeAdapter {
         }
         ensure_no_writers(local, remote_root, transport)?;
 
+        let local_payload = value.temp.path().join("local-payload");
+        let remote_payload = value.temp.path().join("remote-payload");
+        let local_payload_count = build_sparse_payload(
+            &value.stage,
+            &local_payload,
+            &value.report.files,
+            PayloadSide::Local,
+        )?;
+        let remote_payload_count = build_sparse_payload(
+            &value.stage,
+            &remote_payload,
+            &value.report.files,
+            PayloadSide::Remote,
+        )?;
         let stamp = stamp();
         let local_backup = backup_local(local, value.resources, &stamp)?;
         let remote_backup = backup_remote(remote_root, value.resources, &stamp, transport)?;
-        install_local(&value.stage, local, value.resources, &transport.rsync)?;
-        transport.push(&value.stage, remote_root)?;
+        let result_inventory = inventory(&value.stage, exclude)?;
+        let mut journal = crate::state::TransactionJournal::new(
+            "claude",
+            value.resources,
+            &value.local_node_id,
+            &value.remote_node_id,
+            &value.local_fingerprint,
+            &value.remote_fingerprint,
+            &crate::state::content_hash(&result_inventory),
+            &local_backup,
+            &remote_backup,
+        );
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        install_local(&local_payload, local, value.resources, &transport.rsync)?;
+        journal.phase = crate::state::TransactionPhase::LocalApplied;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        transport.push(&remote_payload, remote_root)?;
+        journal.phase = crate::state::TransactionPhase::RemoteApplied;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
         if value.resources.sessions() {
-            normalize_local_mtimes(&value.stage, local)?;
-            normalize_remote_mtimes(&value.stage, remote_root, transport)?;
+            normalize_local_mtimes(&local_payload, local)?;
+            normalize_remote_mtimes(&remote_payload, remote_root, transport)?;
         }
+        journal.phase = crate::state::TransactionPhase::Verified;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
         verify_selected(&value.stage, local, value.resources, "local")?;
         let verified_remote = remote_inventory(
             transport,
@@ -394,8 +443,9 @@ impl Adapter for ClaudeAdapter {
             checkpoint: remote_checkpoint,
         })?;
         crate::state::save(&value.state_root, &local_checkpoint)?;
+        transport.clear_transaction_pair(&value.state_root, &journal)?;
         println!(
-            "complete: Claude synchronized and verified; backups: local={}, remote={}:{}",
+            "complete: Claude synchronized and verified; sparse payloads: local={local_payload_count}, remote={remote_payload_count}; backups: local={}, remote={}:{}",
             local_backup.display(),
             transport.host,
             remote_backup
