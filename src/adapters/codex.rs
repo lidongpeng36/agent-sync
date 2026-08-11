@@ -384,7 +384,7 @@ fn pull_codex(t: &SshTransport, root: &str, dest: &Path, r: ResourceSelection) -
     f.push("--exclude=*");
     t.pull(root, dest, &f)
 }
-fn excluded(p: &Path, r: ResourceSelection) -> bool {
+pub(crate) fn archive_excluded(p: &Path, r: ResourceSelection) -> bool {
     let n = p
         .components()
         .next()
@@ -403,6 +403,10 @@ fn excluded(p: &Path, r: ResourceSelection) -> bool {
         || (!memory && !session)
         || private_memory_metadata
         || p.to_string_lossy().contains("sync-backups")
+}
+
+fn excluded(p: &Path, r: ResourceSelection) -> bool {
+    archive_excluded(p, r)
 }
 
 fn active_excluded_path(path: &Path, active: &BTreeSet<String>) -> bool {
@@ -865,6 +869,17 @@ fn merge_blocks(a: &str, b: &str, heading: &str) -> String {
 }
 
 fn active_writer_ids(local: &Path, remote: &str, t: &SshTransport) -> Result<BTreeSet<String>> {
+    let mut s = local_active_writer_ids(local)?;
+    let remote_ids: Vec<String> = t.remote_request(&RemoteRequest::CodexActiveWriters {
+        root: remote.to_owned(),
+    })?;
+    for id in remote_ids {
+        s.insert(id);
+    }
+    Ok(s)
+}
+
+pub(crate) fn local_active_writer_ids(local: &Path) -> Result<BTreeSet<String>> {
     let mut s = BTreeSet::new();
     let d = local.join("thread-writer-locks");
     if d.exists() {
@@ -879,13 +894,22 @@ fn active_writer_ids(local: &Path, remote: &str, t: &SshTransport) -> Result<BTr
             }
         }
     }
-    let remote_ids: Vec<String> = t.remote_request(&RemoteRequest::CodexActiveWriters {
-        root: remote.to_owned(),
-    })?;
-    for id in remote_ids {
-        s.insert(id);
-    }
     Ok(s)
+}
+
+pub(crate) fn validate_archive_snapshot(root: &Path, resources: ResourceSelection) -> Result<()> {
+    if resources.sessions() {
+        scan_sessions(root, &BTreeSet::new())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn archive_backup(
+    root: &Path,
+    resources: ResourceSelection,
+    archive_stamp: &str,
+) -> Result<PathBuf> {
+    backup_local(root, resources, archive_stamp)
 }
 fn find_uuid(s: &str) -> Option<String> {
     for part in s.split(|c: char| !(c.is_ascii_hexdigit() || c == '-')) {

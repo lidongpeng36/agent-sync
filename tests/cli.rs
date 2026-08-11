@@ -21,7 +21,7 @@ fn sync_requires_known_agent() {
         .args(["sync", "unknown", "mini"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("invalid value 'unknown'"));
+        .stderr(predicate::str::contains("unknown agent \"unknown\""));
 }
 
 #[test]
@@ -29,6 +29,16 @@ fn yes_requires_apply() {
     Command::cargo_bin("agent-sync")
         .unwrap()
         .args(["sync", "codex", "mini", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--apply"));
+}
+
+#[test]
+fn import_force_requires_apply() {
+    Command::cargo_bin("agent-sync")
+        .unwrap()
+        .args(["import", "codex", "archive.tar.gz", "--force"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--apply"));

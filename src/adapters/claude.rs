@@ -381,7 +381,7 @@ fn refresh_remote_mtimes(
     Ok(())
 }
 
-fn excluded(path: &Path, resources: ResourceSelection) -> bool {
+pub(crate) fn archive_excluded(path: &Path, resources: ResourceSelection) -> bool {
     let parts: Vec<_> = path
         .components()
         .map(|c| c.as_os_str().to_string_lossy())
@@ -402,6 +402,46 @@ fn excluded(path: &Path, resources: ResourceSelection) -> bool {
     (memory && !resources.memory())
         || (!memory && !resources.sessions())
         || parts.iter().any(|v| v.as_ref().contains("sync-backups"))
+}
+
+fn excluded(path: &Path, resources: ResourceSelection) -> bool {
+    archive_excluded(path, resources)
+}
+
+pub(crate) fn validate_archive_snapshot(root: &Path, resources: ResourceSelection) -> Result<()> {
+    if resources.sessions() {
+        session_files(root)?;
+        verify_event_mtimes(root, "archive")?;
+    }
+    if resources.memory() {
+        let projects = root.join("projects");
+        if projects.exists() {
+            for entry in fs::read_dir(projects)? {
+                let memory = entry?.path().join("memory");
+                if memory.is_dir() {
+                    let files = memory_files(&memory)?;
+                    memory_index(&memory, &files)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn local_has_writers(root: &Path) -> Result<bool> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-Fpf", "+D"])
+        .arg(root.join("projects"))
+        .output()?;
+    Ok(!parse_lsof_writers(&String::from_utf8_lossy(&output.stdout)).is_empty())
+}
+
+pub(crate) fn archive_backup(
+    root: &Path,
+    resources: ResourceSelection,
+    archive_stamp: &str,
+) -> Result<PathBuf> {
+    backup_local(root, resources, archive_stamp)
 }
 
 fn session_files(root: &Path) -> Result<BTreeMap<PathBuf, FileRecord>> {

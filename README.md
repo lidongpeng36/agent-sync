@@ -52,8 +52,18 @@ agent-sync s claude -f diff > claude-sync.diff
 agent-sync sync codex mini --only memory --apply
 agent-sync sync claude mini --apply --yes
 agent-sync doctor codex mini
+cd ~/.codex && agent-sync sync mini       # infers codex
+agent-sync export codex codex-backup.tar.gz
+agent-sync import codex codex-backup.tar.gz
+agent-sync import codex codex-backup.tar.gz --apply --yes
 agent-sync adapters
 ```
+
+`sync` and `doctor` may omit the agent while the current directory is the
+configured local root (or any directory below it). For example, inside
+`~/.codex`, `agent-sync sync mini` means `agent-sync sync codex mini`; with a
+configured `default_peer`, `agent-sync sync` is sufficient. Explicit agent
+names remain required outside a configured agent directory.
 
 `--apply` asks `Apply these changes? [Y/n]` in a terminal; Enter accepts the
 default `yes`. Non-interactive use requires both `--apply --yes`; `--yes`
@@ -80,6 +90,28 @@ The `sync`, `doctor`, and `adapters` commands have the aliases `s`, `d`, and
 `a`. Common options also have short forms: `-o` (`--only`), `-a` (`--apply`),
 `-y` (`--yes`), `-f` (`--format`), and `-s` (`--conflict-strategy`). Run a
 subcommand with `--help` for the complete list.
+
+### Portable local archives
+
+`agent-sync export <AGENT> <FILE>` creates one portable gzip archive. Inside a
+configured agent directory, omit the agent with `agent-sync export <FILE>`.
+Use `--only sessions` or `--only memory` to narrow the archive and `--force`
+to atomically replace an existing output file.
+
+`agent-sync import <AGENT> <FILE>` fully validates and previews an archive but
+does not write. Apply with `--apply`; non-interactive use also needs `--yes`.
+An import is additive and never deletes local data. A differing existing item
+is a conflict and is not overwritten unless `--apply --force` is explicit.
+The target is backed up before writing and all imported content is read back
+and verified afterward.
+
+The archive manifest records its format version, agent, resource scope,
+creation time, file sizes, and SHA-256 digests. Validation rejects a mismatched
+agent, corrupt/truncated payload, duplicate or unlisted files, unsafe paths,
+links, unsupported agent paths, and oversized expansion. Credentials and
+private metadata remain excluded. OpenCode archives contain official portable
+session exports, never `opencode.db`; source mtimes are preserved for formats
+that use them as synchronization metadata.
 
 The normal human preview uses shortened `project/session` names and a table with
 `LOCAL`, `REMOTE`, and `RESULT` columns. Side symbols describe the operation
@@ -178,6 +210,8 @@ converge. Conflict strategy does not apply to OpenCode sessions.
   SHA-256 manifest after transfer.
 - OpenCode backups remain on their originating machine, and account,
   credential, permission, and authentication tables are never transferred.
+- Portable local archives are checksummed, path-confined, versioned, and
+  validated before preview or import; import is preview-only by default.
 - Session mtimes come from the last event rather than transfer time.
 - Remote filesystem, lock, backup, mtime, and SQLite operations use a versioned
   typed protocol implemented by the same Rust binary; no Python source is sent
@@ -231,6 +265,21 @@ agent-sync sync opencode mini
 `agent-sync s claude`。命令行显式 peer 优先于配置。普通预览会列出逐文件
 动作；`agent-sync s claude -f diff` 输出不截断的完整 unified diff。diff
 可能包含完整 session 和 memory 内容，应按敏感数据处理。
+
+当前目录位于对应配置根目录或其子目录时，可以省略 agent。例如在
+`~/.codex` 中执行 `agent-sync sync mini`；同时配置了 `default_peer` 时可直接
+执行 `agent-sync sync`。本地单文件迁移使用：
+
+```console
+agent-sync export codex codex-backup.tar.gz
+agent-sync import codex codex-backup.tar.gz              # 仅校验和预览
+agent-sync import codex codex-backup.tar.gz --apply --yes
+```
+
+归档包含版本化 manifest、逐文件大小与 SHA-256；导入拒绝损坏内容、危险路径、
+agent 不匹配及未显式允许的覆盖。遇到已有内容不同，必须额外指定
+`--apply --force`。导入前自动备份，导入后重新校验；OpenCode 归档只包含官方
+session export，不包含数据库或凭据。
 
 正式写入使用 `--apply`，交互确认是 `Apply these changes? [Y/n]`，直接回车
 表示确认；脚本环境必须同时使用 `--apply --yes`。Claude 默认使用 `ask`：

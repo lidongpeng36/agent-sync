@@ -91,22 +91,7 @@ impl Config {
             .and_then(|p| p.host.clone())
             .unwrap_or_else(|| peer_name.to_owned());
         validate_host(&host)?;
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-        let default_local = match kind {
-            AgentKind::Codex => home.join(".codex"),
-            AgentKind::Claude => home.join(".claude"),
-            AgentKind::Opencode => home.join(".local/share/opencode"),
-        };
-        let configured = self
-            .agents
-            .get(&key)
-            .and_then(|a| a.local_root.as_deref())
-            .map(expand_home)
-            .transpose()?;
-        let local_root = local
-            .map(PathBuf::from)
-            .or(configured)
-            .unwrap_or(default_local);
+        let local_root = self.local_root(kind, local)?;
         let default_remote = match kind {
             AgentKind::Codex => ".codex",
             AgentKind::Claude => ".claude",
@@ -146,6 +131,55 @@ impl Config {
             .and_then(|agent| agent.conflict_strategy)
             .or(self.conflict_strategy)
             .unwrap_or_default()
+    }
+
+    pub fn local_root(&self, kind: AgentKind, command_line: Option<&Path>) -> Result<PathBuf> {
+        let home = dirs::home_dir().context("cannot determine home directory")?;
+        let default = match kind {
+            AgentKind::Codex => home.join(".codex"),
+            AgentKind::Claude => home.join(".claude"),
+            AgentKind::Opencode => home.join(".local/share/opencode"),
+        };
+        let configured = self
+            .agents
+            .get(&kind.to_string())
+            .and_then(|agent| agent.local_root.as_deref())
+            .map(expand_home)
+            .transpose()?;
+        Ok(command_line
+            .map(PathBuf::from)
+            .or(configured)
+            .unwrap_or(default))
+    }
+
+    pub fn infer_agent(&self, current_dir: &Path) -> Result<AgentKind> {
+        let current = fs::canonicalize(current_dir)
+            .with_context(|| format!("resolve current directory {}", current_dir.display()))?;
+        let mut matches = Vec::new();
+        for kind in AgentKind::all() {
+            let root = self.local_root(kind, None)?;
+            let Ok(root) = fs::canonicalize(&root) else {
+                continue;
+            };
+            if current.starts_with(&root) {
+                matches.push((root.components().count(), kind, root));
+            }
+        }
+        matches.sort_by_key(|(depth, _, _)| *depth);
+        let Some((depth, kind, _)) = matches.pop() else {
+            bail!(
+                "agent is required outside a configured agent directory; pass codex, claude, or opencode"
+            );
+        };
+        if matches
+            .last()
+            .is_some_and(|(other_depth, _, _)| *other_depth == depth)
+        {
+            bail!(
+                "current directory matches multiple configured agent roots; pass the agent explicitly"
+            );
+        }
+        Ok(kind)
     }
 }
 
@@ -245,5 +279,24 @@ mod tests {
         assert_eq!(configured.peer_name(None).unwrap(), "mini");
         assert_eq!(configured.peer_name(Some("dev")).unwrap(), "dev");
         assert!(Config::default().peer_name(None).is_err());
+    }
+
+    #[test]
+    fn infers_agent_from_configured_root_and_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude = temp.path().join("custom-claude");
+        fs::create_dir_all(claude.join("projects/example")).unwrap();
+        let configured: Config = toml::from_str(&format!(
+            "version = 1\n[agents.claude]\nlocal_root = {:?}\n",
+            claude.to_string_lossy()
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .infer_agent(&claude.join("projects/example"))
+                .unwrap(),
+            AgentKind::Claude
+        );
+        assert!(configured.infer_agent(temp.path()).is_err());
     }
 }

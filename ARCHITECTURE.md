@@ -12,7 +12,10 @@ The binary has four layers:
 3. The core owns manifests, path validation, private temporary storage, CLI
    output, confirmation, the shared local/remote/editor conflict interaction,
    and common safety invariants.
-4. Built-in `AgentAdapter` implementations own agent formats, merge policy,
+4. The local archive layer produces a versioned, checksummed single-file
+   portable snapshot, validates it into a path-confined temporary tree, and
+   plans additive imports before any mutation.
+5. Built-in `AgentAdapter` implementations own agent formats, merge policy,
    writer protection, backup selection, and post-apply repair.
 
 The helper handshake carries a protocol version and executable SHA-256. A
@@ -37,6 +40,18 @@ through derived metadata while unrelated resources continue to synchronize.
 The trait is an internal Rust extension point, not a stable dynamic-plugin ABI.
 Adding another agent means adding a module with fixtures that prove validation,
 merge, writer, backup, and idempotency behavior.
+
+Current-directory agent inference compares the canonical current directory
+with configured local roots and chooses the deepest containing root. No match
+or an ambiguous match requires an explicit agent. Archive import separately
+checks that the selected/inferred agent equals the manifest agent.
+
+Portable archives contain `manifest.json` plus regular files below `payload/`.
+The manifest declares the schema version, agent, resource selection, size, and
+SHA-256 of every payload file. Extraction rejects unsafe paths, links,
+duplicates, undeclared content, and expansion limits before adapter validation.
+Codex and Claude archives use their normal path allowlists and validators;
+OpenCode archives use official session exports and semantic session hashes.
 
 The current transfer backend remains rsync. The next transport step is a
 manifest/file-stream RPC with append-aware JSONL transfer; it can replace

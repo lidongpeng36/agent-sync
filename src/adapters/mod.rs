@@ -1,6 +1,6 @@
-mod claude;
-mod codex;
-mod opencode;
+pub(crate) mod claude;
+pub(crate) mod codex;
+pub(crate) mod opencode;
 
 use crate::core::{OutputFormat, PlanReport, SyncOptions};
 use crate::transport::SshTransport;
@@ -13,11 +13,21 @@ pub use claude::ClaudePrepared;
 pub use codex::CodexPrepared;
 pub use opencode::OpenCodePrepared;
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum AgentKind {
     Codex,
     Claude,
     Opencode,
+}
+
+impl AgentKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::from_str(value, true).ok()
+    }
+
+    pub const fn all() -> [Self; 3] {
+        [Self::Codex, Self::Claude, Self::Opencode]
+    }
 }
 
 impl fmt::Display for AgentKind {

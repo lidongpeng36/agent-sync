@@ -401,6 +401,93 @@ fn write_exports(root: &Path, sessions: &BTreeMap<String, SessionExport>) -> Res
     Ok(())
 }
 
+pub(crate) fn archive_snapshot(root: &Path, destination: &Path) -> Result<()> {
+    ensure_cli_root(root)?;
+    let sessions = export_local(&local_session_ids(root)?)?;
+    write_exports(destination, &sessions)
+}
+
+pub(crate) fn validate_archive_snapshot(root: &Path) -> Result<()> {
+    let directory = root.join("sessions");
+    if !directory.exists() {
+        bail!("OpenCode archive omitted sessions directory");
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            bail!("unsupported OpenCode archive entry: {}", path.display());
+        }
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("invalid OpenCode archive filename")?;
+        SessionExport::parse(&fs::read(&path)?, id)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn archive_session_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut result = BTreeMap::new();
+    let directory = root.join("sessions");
+    if !directory.exists() {
+        return Ok(result);
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("invalid OpenCode archive filename")?;
+        let session = SessionExport::parse(&fs::read(&path)?, id)?;
+        result.insert(id.to_owned(), session.canonical_hash()?);
+    }
+    Ok(result)
+}
+
+pub(crate) fn current_session_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
+    ensure_cli_root(root)?;
+    export_local(&local_session_ids(root)?)?
+        .into_iter()
+        .map(|(id, session)| Ok((id, session.canonical_hash()?)))
+        .collect::<Result<_>>()
+}
+
+pub(crate) fn apply_archive_snapshot(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root.join("sessions"))? {
+        import_local(&entry?.path())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn archive_has_writers(root: &Path) -> Result<bool> {
+    local_writers(root)
+}
+
+pub(crate) fn archive_backup(root: &Path, archive_stamp: &str) -> Result<PathBuf> {
+    ensure_cli_root(root)?;
+    local_backup(root, archive_stamp)
+}
+
+fn ensure_cli_root(root: &Path) -> Result<()> {
+    let output = Command::new("opencode").args(["db", "path"]).output()?;
+    if !output.status.success() {
+        bail!(
+            "`opencode db path` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let configured = fs::canonicalize(root.join("opencode.db"))?;
+    let reported = fs::canonicalize(PathBuf::from(String::from_utf8(output.stdout)?.trim()))?;
+    if reported != configured {
+        bail!(
+            "configured OpenCode root differs from `opencode db path`: configured={}, reported={}",
+            configured.display(),
+            reported.display()
+        );
+    }
+    Ok(())
+}
+
 fn fingerprint(sessions: &BTreeMap<String, SessionExport>) -> Result<BTreeMap<String, String>> {
     sessions
         .iter()
