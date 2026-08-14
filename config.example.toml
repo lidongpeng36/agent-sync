@@ -1,5 +1,7 @@
 version = 1
 # default_peer = "mini"
+# Keep at least the newest verified backup set on each endpoint.
+backup_retention = 1
 
 [peers.mini]
 host = "mini"

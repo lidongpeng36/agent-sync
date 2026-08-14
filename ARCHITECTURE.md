@@ -81,3 +81,7 @@ derives endpoint-specific sparse payloads from the full result plan. Before the
 first write, both endpoints persist the same transaction ID, source
 generations, result hash, phase, and backup locations; each phase transition is
 durable, and later writes refuse to proceed over an unfinished partial commit.
+After verification, checkpointing, and successful journal cleanup, each
+endpoint independently prunes generated backup sets to the configured bounded
+retention. The just-created set is protected explicitly, and cleanup failure is
+reported without changing a completed transaction into a failed one.

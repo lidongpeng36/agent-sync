@@ -3,7 +3,7 @@ use crate::core::{
     Blocker, FileAction, FileChange, Inventory, InventoryEntry, PlanReport, ResourceSelection,
     SyncOptions, bytes_sha256, print_planned_diff, private_dir, shorten_middle, stamp,
 };
-use crate::remote::Request as RemoteRequest;
+use crate::remote::{BackupKind, Request as RemoteRequest};
 use crate::transport::SshTransport;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
@@ -924,7 +924,7 @@ impl Adapter for OpenCodeAdapter {
         let remote_backup: OpenCodeBackupResult =
             transport.remote_request(&RemoteRequest::OpenCodeBackup {
                 root: remote.to_owned(),
-                stamp: backup_stamp,
+                stamp: backup_stamp.clone(),
             })?;
         let mut journal = crate::state::TransactionJournal::new(
             "opencode",
@@ -991,6 +991,15 @@ impl Adapter for OpenCodeAdapter {
         })?;
         crate::state::save(&value.state_root, &local_checkpoint)?;
         transport.clear_transaction_pair(&value.state_root, &journal)?;
+        for message in transport.prune_backup_pair(
+            local,
+            remote,
+            BackupKind::Opencode,
+            options.backup_retention,
+            &backup_stamp,
+        ) {
+            println!("{message}");
+        }
         println!(
             "complete: OpenCode sessions synchronized and verified; backups: local={}, remote={}:{}",
             local_backup.display(),

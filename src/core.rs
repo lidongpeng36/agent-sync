@@ -195,6 +195,7 @@ pub struct SyncOptions {
     pub apply: bool,
     pub stability_seconds: f64,
     pub cache_dir: Option<PathBuf>,
+    pub backup_retention: usize,
     pub resources: ResourceSelection,
     pub conflict_strategy: ConflictStrategy,
 }

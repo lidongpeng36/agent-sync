@@ -6,7 +6,7 @@ use crate::core::{
     inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
     safe_relative, seed_remote_deltas, sha256, stamp,
 };
-use crate::remote::{MtimeUpdate, Request as RemoteRequest, create_backup};
+use crate::remote::{BackupKind, MtimeUpdate, Request as RemoteRequest, create_backup};
 use crate::transport::SshTransport;
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
@@ -444,6 +444,15 @@ impl Adapter for ClaudeAdapter {
         })?;
         crate::state::save(&value.state_root, &local_checkpoint)?;
         transport.clear_transaction_pair(&value.state_root, &journal)?;
+        for message in transport.prune_backup_pair(
+            local,
+            remote_root,
+            BackupKind::Claude,
+            options.backup_retention,
+            &stamp,
+        ) {
+            println!("{message}");
+        }
         println!(
             "complete: Claude synchronized and verified; sparse payloads: local={local_payload_count}, remote={remote_payload_count}; backups: local={}, remote={}:{}",
             local_backup.display(),

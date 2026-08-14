@@ -1,5 +1,5 @@
 use crate::core::{ResourceSelection, private_dir, safe_relative};
-use crate::remote::{PROTOCOL_VERSION, Request, Response};
+use crate::remote::{BackupKind, BackupPruneResult, PROTOCOL_VERSION, Request, Response};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use std::fs::File;
@@ -335,6 +335,36 @@ impl SshTransport {
         crate::state::clear_transaction(local_state_root, &journal.agent, &journal.transaction_id)
     }
 
+    pub fn prune_backup_pair(
+        &self,
+        local_root: &Path,
+        remote_root: &str,
+        agent: BackupKind,
+        keep: usize,
+        protected_stamp: &str,
+    ) -> Vec<String> {
+        let mut messages = Vec::new();
+        match crate::remote::prune_backups(local_root, agent, keep, protected_stamp) {
+            Ok(result) => messages.push(prune_message("local", result)),
+            Err(error) => messages.push(format!(
+                "warning: local backup retention stopped before completion: {error:#}"
+            )),
+        }
+        match self.remote_request::<BackupPruneResult>(&Request::PruneBackups {
+            root: remote_root.to_owned(),
+            agent,
+            keep,
+            protected_stamp: protected_stamp.to_owned(),
+        }) {
+            Ok(result) => messages.push(prune_message(&format!("remote {}", self.host), result)),
+            Err(error) => messages.push(format!(
+                "warning: remote backup retention on {} stopped before completion: {error:#}",
+                self.host
+            )),
+        }
+        messages
+    }
+
     fn raw_request<T: DeserializeOwned>(&self, path: &str, request: &Request) -> Result<T> {
         let mut child = self.spawn_helper(path)?;
         serde_json::to_writer(
@@ -433,6 +463,13 @@ impl SshTransport {
         }
         Ok(())
     }
+}
+
+fn prune_message(endpoint: &str, result: BackupPruneResult) -> String {
+    format!(
+        "backup retention: {endpoint} retained {} set(s), removed {} file(s) ({} bytes)",
+        result.retained_sets, result.removed_files, result.removed_bytes
+    )
 }
 
 fn parse_transfer_stats(output: &str) -> TransferStats {

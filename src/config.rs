@@ -13,6 +13,7 @@ pub struct Config {
     version: u32,
     default_peer: Option<String>,
     conflict_strategy: Option<ConflictStrategy>,
+    backup_retention: Option<usize>,
     #[serde(default)]
     peers: BTreeMap<String, Peer>,
     #[serde(default)]
@@ -35,6 +36,7 @@ struct Peer {
 struct Agent {
     local_root: Option<String>,
     conflict_strategy: Option<ConflictStrategy>,
+    backup_retention: Option<usize>,
 }
 
 fn version() -> u32 {
@@ -134,6 +136,19 @@ impl Config {
             .and_then(|agent| agent.conflict_strategy)
             .or(self.conflict_strategy)
             .unwrap_or_default()
+    }
+
+    pub fn backup_retention(&self, kind: AgentKind) -> Result<usize> {
+        let retention = self
+            .agents
+            .get(&kind.to_string())
+            .and_then(|agent| agent.backup_retention)
+            .or(self.backup_retention)
+            .unwrap_or(1);
+        if retention == 0 {
+            bail!("backup_retention must be at least 1");
+        }
+        Ok(retention)
     }
 
     pub fn local_root(&self, kind: AgentKind, command_line: Option<&Path>) -> Result<PathBuf> {
@@ -298,6 +313,30 @@ mod tests {
             .resolve(AgentKind::Codex, "mini", None, None)
             .unwrap();
         assert_eq!(resolved.bandwidth_limit_kbps, Some(16_384));
+    }
+
+    #[test]
+    fn backup_retention_defaults_to_one_and_can_be_overridden() {
+        assert_eq!(
+            Config::default()
+                .backup_retention(AgentKind::Codex)
+                .unwrap(),
+            1
+        );
+        let configured: Config = toml::from_str(
+            r#"
+            version = 1
+            backup_retention = 3
+            [agents.codex]
+            backup_retention = 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.backup_retention(AgentKind::Codex).unwrap(), 2);
+        assert_eq!(configured.backup_retention(AgentKind::Claude).unwrap(), 3);
+
+        let invalid: Config = toml::from_str("version = 1\nbackup_retention = 0\n").unwrap();
+        assert!(invalid.backup_retention(AgentKind::Codex).is_err());
     }
 
     #[test]

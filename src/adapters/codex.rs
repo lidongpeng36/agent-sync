@@ -6,7 +6,7 @@ use crate::core::{
     inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
     seed_remote_deltas, stamp,
 };
-use crate::remote::{Request as RemoteRequest, StateTimes, create_backup};
+use crate::remote::{BackupKind, Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
@@ -271,7 +271,7 @@ impl Adapter for CodexAdapter {
         local: &Path,
         remote_root: &str,
         transport: &SshTransport,
-        _options: &SyncOptions,
+        options: &SyncOptions,
     ) -> Result<()> {
         let Prepared::Codex(value) = prepared else {
             bail!("adapter/prepared plan mismatch");
@@ -421,6 +421,15 @@ impl Adapter for CodexAdapter {
         })?;
         crate::state::save(&value.state_root, &local_checkpoint)?;
         transport.clear_transaction_pair(&value.state_root, &journal)?;
+        for message in transport.prune_backup_pair(
+            local,
+            remote_root,
+            BackupKind::Codex,
+            options.backup_retention,
+            &stamp,
+        ) {
+            println!("{message}");
+        }
         println!(
             "complete: Codex synchronized and verified; sparse payloads: local={local_payload_count}, remote={remote_payload_count}; backups: local={}, remote={}:{}",
             local_backup.display(),

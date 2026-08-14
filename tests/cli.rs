@@ -60,14 +60,27 @@ fn help_documents_read_only_default() {
 fn remote_helper_negotiates_the_typed_protocol() {
     let output = Command::cargo_bin("agent-sync")
         .unwrap()
-        .args(["__remote", "--protocol", "3"])
+        .args(["__remote", "--protocol", "4"])
         .write_stdin("{\"op\":\"ping\"}\n")
         .output()
         .unwrap();
     assert!(output.status.success());
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["protocol"], 3);
+    assert_eq!(response["protocol"], 4);
     assert_eq!(response["ok"], true);
-    assert_eq!(response["value"]["protocol"], 3);
+    assert_eq!(response["value"]["protocol"], 4);
     assert!(response["value"]["executable_sha256"].as_str().is_some());
+}
+
+#[test]
+fn remote_helper_rejects_an_old_protocol() {
+    Command::cargo_bin("agent-sync")
+        .unwrap()
+        .args(["__remote", "--protocol", "3"])
+        .write_stdin("{\"op\":\"ping\"}\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unsupported protocol 3; expected 4",
+        ));
 }

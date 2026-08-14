@@ -14,7 +14,22 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupKind {
+    Codex,
+    Claude,
+    Opencode,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct BackupPruneResult {
+    pub removed_files: usize,
+    pub removed_bytes: u64,
+    pub retained_sets: usize,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -89,6 +104,12 @@ pub enum Request {
         backup_dir: String,
         stamp: String,
         members: Vec<String>,
+    },
+    PruneBackups {
+        root: String,
+        agent: BackupKind,
+        keep: usize,
+        protected_stamp: String,
     },
     CodexState {
         root: String,
@@ -348,6 +369,17 @@ fn dispatch(request: Request) -> Result<Value> {
             create_backup(&root, &out, &members)?;
             Ok(serde_json::json!({ "path": out.to_string_lossy() }))
         }
+        Request::PruneBackups {
+            root,
+            agent,
+            keep,
+            protected_stamp,
+        } => Ok(serde_json::to_value(prune_backups(
+            &expand_root(&root)?,
+            agent,
+            keep,
+            &protected_stamp,
+        )?)?),
         Request::CodexState { root, stamp, times } => {
             let root = expand_root(&root)?;
             if let Some(times) = times {
@@ -662,6 +694,95 @@ pub fn create_backup(root: &Path, out: &Path, members: &[String]) -> Result<()> 
     result
 }
 
+pub fn prune_backups(
+    root: &Path,
+    agent: BackupKind,
+    keep: usize,
+    protected_stamp: &str,
+) -> Result<BackupPruneResult> {
+    if keep == 0 {
+        bail!("backup retention must be at least 1");
+    }
+    if !valid_backup_stamp(protected_stamp) {
+        bail!("invalid protected backup stamp");
+    }
+    let (directory, suffix) = match agent {
+        BackupKind::Codex => (root.join("sync-backups"), ".tar.gz"),
+        BackupKind::Claude => (root.join("agent-sync-backups"), ".tar.gz"),
+        BackupKind::Opencode => (root.join("agent-sync-backups"), ".db"),
+    };
+    let mut sets = Vec::new();
+    for entry in fs::read_dir(&directory)
+        .with_context(|| format!("read backup directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stamp) = name
+            .strip_prefix("before-")
+            .and_then(|value| value.strip_suffix(suffix))
+            .filter(|value| valid_backup_stamp(value))
+        else {
+            continue;
+        };
+        sets.push((stamp.to_owned(), entry.path()));
+    }
+    sets.sort_by(|left, right| left.0.cmp(&right.0));
+    if !sets.iter().any(|(stamp, _)| stamp == protected_stamp) {
+        bail!("protected backup set is missing");
+    }
+
+    let retained = sets
+        .iter()
+        .rev()
+        .filter(|(stamp, _)| stamp != protected_stamp)
+        .take(keep.saturating_sub(1))
+        .map(|(stamp, _)| stamp.clone())
+        .chain(std::iter::once(protected_stamp.to_owned()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut result = BackupPruneResult {
+        removed_files: 0,
+        removed_bytes: 0,
+        retained_sets: retained.len(),
+    };
+    for (stamp, path) in sets {
+        if retained.contains(&stamp) {
+            continue;
+        }
+        result.removed_bytes += fs::metadata(&path)?.len();
+        fs::remove_file(&path).with_context(|| format!("remove old backup {}", path.display()))?;
+        result.removed_files += 1;
+        if matches!(agent, BackupKind::Codex) {
+            let companion = directory.join(format!("state-before-{stamp}.sqlite"));
+            match fs::symlink_metadata(&companion) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    result.removed_bytes += metadata.len();
+                    fs::remove_file(&companion)
+                        .with_context(|| format!("remove old backup {}", companion.display()))?;
+                    result.removed_files += 1;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn valid_backup_stamp(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    matches!(parts.as_slice(), [date, time] | [date, time, _] if date.len() == 8 && time.len() == 6)
+        && parts.iter().enumerate().all(|(index, part)| {
+            (index < 2 || part.len() == 6) && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 fn state_db(root: &Path) -> Result<PathBuf> {
     let mut candidates = Vec::new();
     for entry in fs::read_dir(root)? {
@@ -745,6 +866,46 @@ mod tests {
             fs::read(unpacked.path().join("projects/example/session.jsonl"))?,
             b"event\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn backup_pruning_keeps_protected_set_and_unknown_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("sync-backups");
+        private_dir(&directory)?;
+        for stamp in ["20260810-010101-000001", "20260811-010101-000001"] {
+            fs::write(directory.join(format!("before-{stamp}.tar.gz")), stamp)?;
+            fs::write(
+                directory.join(format!("state-before-{stamp}.sqlite")),
+                stamp,
+            )?;
+        }
+        fs::write(
+            directory.join("state-before-catalog-time-repair.sqlite"),
+            b"manual",
+        )?;
+        fs::write(directory.join("before-manual.tar.gz"), b"manual")?;
+
+        let result = prune_backups(root.path(), BackupKind::Codex, 1, "20260810-010101-000001")?;
+        assert_eq!(result.removed_files, 2);
+        assert_eq!(result.retained_sets, 1);
+        assert!(
+            directory
+                .join("before-20260810-010101-000001.tar.gz")
+                .is_file()
+        );
+        assert!(
+            directory
+                .join("state-before-20260810-010101-000001.sqlite")
+                .is_file()
+        );
+        assert!(
+            directory
+                .join("state-before-catalog-time-repair.sqlite")
+                .is_file()
+        );
+        assert!(directory.join("before-manual.tar.gz").is_file());
         Ok(())
     }
 }

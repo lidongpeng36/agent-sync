@@ -121,6 +121,9 @@ struct SyncArgs {
     /// Directory for per-peer checkpoints, scan hashes, node identity, and sync locks.
     #[arg(short = 'C', long)]
     cache_dir: Option<PathBuf>,
+    /// Keep this many verified backup sets on each endpoint (minimum 1).
+    #[arg(long, value_parser = parse_backup_retention)]
+    backup_retention: Option<usize>,
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Human)]
     format: Format,
     /// Resolve irreconcilable conflicts by asking or preferring one side.
@@ -181,6 +184,14 @@ fn parse_bandwidth_limit(value: &str) -> Result<u64, String> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| "must be a positive number of KiB/s".to_owned())
+}
+
+fn parse_backup_retention(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "must be at least 1".to_owned())
 }
 
 #[derive(Serialize)]
@@ -393,6 +404,10 @@ fn run() -> Result<i32> {
                 apply: args.apply,
                 stability_seconds: args.stability_seconds,
                 cache_dir: args.cache_dir.clone(),
+                backup_retention: match args.backup_retention {
+                    Some(retention) => retention,
+                    None => config.backup_retention(agent)?,
+                },
                 resources,
                 conflict_strategy: args
                     .conflict_strategy

@@ -160,6 +160,8 @@ version = 1
 default_peer = "mini"
 # Optional global default; defaults to "ask" when omitted.
 conflict_strategy = "ask"
+# Successful syncs retain only this many backup sets on each endpoint.
+backup_retention = 1
 
 [peers.mini]
 host = "mini"
@@ -173,6 +175,7 @@ local_root = "~/.codex"
 local_root = "~/.claude"
 # Optional agent-specific override:
 # conflict_strategy = "local"
+# backup_retention = 2
 
 [agents.opencode]
 local_root = "~/.local/share/opencode"
@@ -232,6 +235,9 @@ converge. Conflict strategy does not apply to OpenCode sessions.
   after their manifest generation changes.
 - Both sides are backed up before mutation and verified against the staged
   SHA-256 manifest after transfer.
+- After both transaction journals are cleared, old generated backups are
+  pruned on each endpoint. The current backup set is always protected and the
+  retention defaults to one; unknown or manually named files are left alone.
 - Apply builds separate sparse payloads for each endpoint, so unchanged files
   are not reinstalled or listed in the write transfer.
 - A durable transaction journal records prepared, local-applied,
