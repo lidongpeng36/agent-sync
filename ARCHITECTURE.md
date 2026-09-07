@@ -96,6 +96,11 @@ Conservative line-based diff3 combines disjoint edits using the existing
 `similar` diff engine; overlapping edits and ambiguous insertion order require
 shared conflict interaction. This replaces the former longer-block and summary
 concatenation heuristics. Session merge behavior is unchanged.
+For unresolved Codex memory, the shared editor preserves equal lines once and
+marks each differing region separately, keeping unchanged Markdown headings and
+sections as context. This is presentation only: without a trusted baseline,
+one-sided text still requires a choice, and local/remote choices remain whole-file
+choices.
 
 After full two-endpoint verification and durable `verified` journals, each
 endpoint independently checks baseline text against its installed memory and

@@ -559,6 +559,7 @@ fn edit_codex_conflict(conflict: &CodexConflict, root: &Path) -> Result<Vec<u8>>
             local: &conflict.local_bytes,
             remote: &conflict.remote_bytes,
             remote_label: "REMOTE",
+            localized_conflicts: conflict.resource == "memory",
         }],
     )?;
     let bytes = edited.remove(0);

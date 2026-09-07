@@ -42,6 +42,7 @@ pub struct EditDocument<'a> {
     pub local: &'a [u8],
     pub remote: &'a [u8],
     pub remote_label: &'a str,
+    pub localized_conflicts: bool,
 }
 
 pub fn file_lock_is_held(file: &File) -> Result<bool> {
@@ -59,10 +60,43 @@ fn conflict_markers(local: &str, remote: &str, remote_label: &str) -> String {
     format!(
         "<<<<<<< LOCAL\n{}{}=======\n{}{}>>>>>>> {remote_label}\n",
         local,
-        if local.ends_with('\n') { "" } else { "\n" },
+        if local.is_empty() || local.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        },
         remote,
-        if remote.ends_with('\n') { "" } else { "\n" },
+        if remote.is_empty() || remote.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        },
     )
+}
+
+// Keep shared Markdown context outside conflict markers. Without a trusted
+// base, even one-sided additions/deletions still require an explicit choice.
+fn localized_conflict_markers(local: &str, remote: &str, remote_label: &str) -> String {
+    use similar::{Algorithm, DiffTag, capture_diff_slices};
+    let local: Vec<_> = local.split_inclusive('\n').collect();
+    let remote: Vec<_> = remote.split_inclusive('\n').collect();
+    let mut result = String::new();
+    for op in capture_diff_slices(Algorithm::Myers, &local, &remote) {
+        let left = local[op.old_range()].concat();
+        if op.tag() == DiffTag::Equal {
+            result.push_str(&left);
+        } else {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&conflict_markers(
+                &left,
+                &remote[op.new_range()].concat(),
+                remote_label,
+            ));
+        }
+    }
+    result
 }
 
 fn has_conflict_markers(content: &str) -> bool {
@@ -113,6 +147,8 @@ pub fn edit_conflict_documents(
             std::str::from_utf8(document.remote).context("remote conflict content is not UTF-8")?;
         let content = if local == remote {
             local.to_owned()
+        } else if document.localized_conflicts {
+            localized_conflict_markers(local, remote, document.remote_label)
         } else {
             conflict_markers(local, remote, document.remote_label)
         };
@@ -1170,6 +1206,48 @@ mod tests {
         assert!(text.ends_with(">>>>>>> REMOTE mini\n"));
         assert!(has_conflict_markers(&text));
         assert!(!has_conflict_markers("resolved\n"));
+    }
+
+    #[test]
+    fn memory_editor_keeps_shared_markdown_outside_separate_conflicts() {
+        let local =
+            "# Memory\n\n## First\nlocal first\n\n## Shared\nunchanged\n\n## Last\nlocal last\n";
+        let remote =
+            "# Memory\n\n## First\nremote first\n\n## Shared\nunchanged\n\n## Last\nremote last\n";
+        let text = localized_conflict_markers(local, remote, "REMOTE");
+        assert_eq!(
+            text,
+            "# Memory\n\n## First\n<<<<<<< LOCAL\nlocal first\n=======\nremote first\n>>>>>>> REMOTE\n\n## Shared\nunchanged\n\n## Last\n<<<<<<< LOCAL\nlocal last\n=======\nremote last\n>>>>>>> REMOTE\n"
+        );
+    }
+
+    #[test]
+    fn memory_editor_requires_choices_for_one_sided_text_without_base() {
+        for (local, remote) in [
+            ("# Memory\nextra\n", "# Memory\n"),
+            ("# Memory\n", "# Memory\nextra\n"),
+            ("", "extra"),
+            ("extra", ""),
+        ] {
+            let text = localized_conflict_markers(local, remote, "REMOTE");
+            assert_eq!(text.matches("<<<<<<< LOCAL\n").count(), 1);
+            assert!(text.contains("extra"));
+            assert!(has_conflict_markers(&text));
+        }
+        assert_eq!(
+            localized_conflict_markers("# Memory\nextra\n", "# Memory\n", "REMOTE"),
+            "# Memory\n<<<<<<< LOCAL\nextra\n=======\n>>>>>>> REMOTE\n"
+        );
+    }
+
+    #[test]
+    fn memory_editor_preserves_identical_text_and_marks_final_newline_changes() {
+        for text in ["", "# 相同\n\n正文", "same\nsame\n"] {
+            assert_eq!(localized_conflict_markers(text, text, "REMOTE"), text);
+        }
+        let text = localized_conflict_markers("# Memory\ntext", "# Memory\ntext\n", "REMOTE");
+        assert!(text.starts_with("# Memory\n<<<<<<< LOCAL\n"));
+        assert!(has_conflict_markers(&text));
     }
     #[test]
     fn rejects_unsafe_relative_paths() {

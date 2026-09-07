@@ -129,12 +129,14 @@ fn edit_memory_conflict(
                 local: &local_content,
                 remote: &remote_content,
                 remote_label: &remote_label,
+                localized_conflicts: false,
             },
             EditDocument {
                 name: "MEMORY-entry.md",
                 local: &local_index,
                 remote: &remote_index,
                 remote_label: &remote_label,
+                localized_conflicts: false,
             },
         ],
     )?;
