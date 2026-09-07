@@ -1,0 +1,67 @@
+[
+  {
+    "name": "same_rule_opposite_meaning",
+    "description": "同一条规则，内容高度相近，但 restart 与 reload 结论相反",
+    "base": "# 服务维护\n- 配置变更后更新服务。\n",
+    "local": "# 服务维护\n- 配置变更后必须 restart 服务。\n",
+    "remote": "# 服务维护\n- 配置变更后必须 reload 服务。\n",
+    "merged": null
+  },
+  {
+    "name": "same_rule_different_number",
+    "description": "同一条备份规则，仅数字不同也必须冲突",
+    "base": "# 备份\n- 保留 1 份备份。\n",
+    "local": "# 备份\n- 保留 3 份备份。\n",
+    "remote": "# 备份\n- 保留 7 份备份。\n",
+    "merged": null
+  },
+  {
+    "name": "independent_conversations_different_sections",
+    "description": "不同对话在各自章节新增结论，双方内容均保留",
+    "base": "# Memory\n## 网络对话\n- 主机为 mini。\n\n## 字幕对话\n- 使用印尼语字幕。\n",
+    "local": "# Memory\n## 网络对话\n- 主机为 mini。\n- 配置变更后 reload。\n\n## 字幕对话\n- 使用印尼语字幕。\n",
+    "remote": "# Memory\n## 网络对话\n- 主机为 mini。\n\n## 字幕对话\n- 使用印尼语字幕。\n- 检查完整影片时间轴。\n",
+    "merged": "# Memory\n## 网络对话\n- 主机为 mini。\n- 配置变更后 reload。\n\n## 字幕对话\n- 使用印尼语字幕。\n- 检查完整影片时间轴。\n"
+  },
+  {
+    "name": "independent_conversations_same_append_position",
+    "description": "内容无关但都在文件末尾新增；当前算法保守要求选择，不擅自排序",
+    "base": "# Memory\n",
+    "local": "# Memory\n## Thread: network\n- 配置变更后 reload。\n",
+    "remote": "# Memory\n## Thread: subtitles\n- 检查完整影片时间轴。\n",
+    "merged": null
+  },
+  {
+    "name": "same_position_unrelated_replacements",
+    "description": "低相似度不能证明来自独立对话；同一旧规则被替换仍有冲突",
+    "base": "# 发布流程\n- 发布前运行测试。\n",
+    "local": "# 发布流程\n- 每周一由值班工程师更新。\n",
+    "remote": "# 发布流程\n- 删除旧环境后立即上线。\n",
+    "merged": null
+  },
+  {
+    "name": "identical_addition_once",
+    "description": "两边新增完全相同的结论，保留一次",
+    "base": "# Memory\n",
+    "local": "# Memory\n- 先备份再修改。\n",
+    "remote": "# Memory\n- 先备份再修改。\n",
+    "merged": "# Memory\n- 先备份再修改。\n"
+  },
+  {
+    "name": "delete_versus_edit",
+    "description": "一边删除过时规则，另一边更新该规则，不能复活或丢弃任一意图",
+    "base": "# Memory\n- 上线前人工确认。\n- 保存备份。\n",
+    "local": "# Memory\n- 保存备份。\n",
+    "remote": "# Memory\n- 上线前由负责人确认。\n- 保存备份。\n",
+    "merged": null
+  },
+  {
+    "name": "semantic_contradiction_on_disjoint_lines",
+    "description": "已知能力边界：不同文本位置仍可能产生语义矛盾；文本成功不是语义通过",
+    "semantic_review_required": true,
+    "base": "# 同一服务的维护规则\n- 更新方式：待确认。\n- 操作范围：生产环境。\n- 禁止操作：待确认。\n",
+    "local": "# 同一服务的维护规则\n- 更新方式：必须 restart 服务。\n- 操作范围：生产环境。\n- 禁止操作：待确认。\n",
+    "remote": "# 同一服务的维护规则\n- 更新方式：待确认。\n- 操作范围：生产环境。\n- 禁止操作：禁止 restart 服务。\n",
+    "merged": "# 同一服务的维护规则\n- 更新方式：必须 restart 服务。\n- 操作范围：生产环境。\n- 禁止操作：禁止 restart 服务。\n"
+  }
+]

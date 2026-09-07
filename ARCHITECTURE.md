@@ -85,3 +85,24 @@ After verification, checkpointing, and successful journal cleanup, each
 endpoint independently prunes generated backup sets to the configured bounded
 retention. The just-created set is protected explicitly, and cleanup failure is
 reported without changing a completed transaction into a failed one.
+
+Codex Markdown memory uses a separate durable, paired content baseline in the
+OS local data directory. Each checksummed snapshot contains only allowlisted
+UTF-8 Markdown text and is scoped to sorted node/root endpoints and resource
+selection. Both copies must match before they can inform planning; missing or
+invalid snapshots cause an explicit conflict for differing content. Baseline
+identity and contents are revalidated under endpoint locks before apply.
+Conservative line-based diff3 combines disjoint edits using the existing
+`similar` diff engine; overlapping edits and ambiguous insertion order require
+shared conflict interaction. This replaces the former longer-block and summary
+concatenation heuristics. Session merge behavior is unchanged.
+
+After full two-endpoint verification and durable `verified` journals, each
+endpoint independently checks baseline text against its installed memory and
+atomically publishes the same snapshot with file and directory fsync. A partial
+publication cannot be used because the snapshots differ. Baseline writes require
+the matching verified Codex journal; ordinary checkpoint loss does not create
+trust. The typed protocol carries baseline reads and verified publication, never
+arbitrary file writes. Active-excluded paths are omitted and whole-file removal
+remains unsupported. Preview baseline RPC content sizes are reported separately
+from rsync transfer statistics.

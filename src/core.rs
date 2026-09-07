@@ -532,7 +532,12 @@ fn resolution_symbol(resolution: &str) -> &'static str {
 }
 
 fn blocker_explanation(blocker: &Blocker) -> &str {
-    if blocker.reason.contains("requires a choice") {
+    if blocker
+        .reason
+        .starts_with("Codex memory requires a choice:")
+    {
+        &blocker.reason
+    } else if blocker.reason.contains("requires a choice") {
         "Automatic merge could not safely combine the memory content or its index."
     } else if blocker.reason.contains("active") {
         "A session is still active; close its writer and run sync again."

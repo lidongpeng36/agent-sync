@@ -2,6 +2,7 @@ mod adapters;
 mod archive;
 mod config;
 mod core;
+mod memory_merge;
 mod remote;
 mod state;
 mod transport;

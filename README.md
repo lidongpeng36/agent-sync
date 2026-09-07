@@ -220,6 +220,40 @@ of copying the database. Linear histories take the longer version; true
 divergences are retained under a deterministic fork ID so multi-machine syncs
 converge. Conflict strategy does not apply to OpenCode sessions.
 
+## Codex memory content merges
+
+Codex UTF-8 `.md` memory files use a shared, verified content baseline. This
+includes rollout summaries, skills, `MEMORY.md`, `raw_memories.md`, and
+`memory_summary.md`. One-sided changes and non-overlapping line edits merge
+automatically; identical edits are kept once. Overlapping edits, delete/edit
+conflicts, and different insertions at the same position require `l/r/e` (or the
+explicit local/remote strategy). Preview notes identify automatic three-way
+merges. These are textual merges; review the diff when instruction semantics
+matter.
+
+The first successful apply establishes the baseline. Without matching valid
+baselines on both endpoints, differing files still require a choice. The old
+longer-block selection and nested local/remote summary concatenation are no
+longer used. Non-text and non-Markdown differences remain explicit conflicts.
+Whole-file deletion is not propagated; synchronization remains additive.
+
+Baselines contain private copies of eligible memory text, stored atomically
+under the OS local data directory (`~/Library/Application Support/agent-sync/memory-baselines` on macOS; `$XDG_DATA_HOME/agent-sync/memory-baselines` or
+`~/.local/share/agent-sync/memory-baselines` on Linux), separately from disposable
+checkpoint caches. Each endpoint keeps one current snapshot per pair of node
+IDs, canonical Codex roots, and resource selection (`all` and `memory` are
+separate). Reversing sync direction uses the same baseline. Missing, corrupt,
+or mismatched snapshots cause conservative conflict handling, not data loss.
+Excluded active-session paths never enter a new baseline.
+
+A baseline advances only after both endpoints pass full content verification
+and both transaction journals reach `verified`. Apply rechecks the baseline
+used for preview while holding both endpoint locks. An interrupted baseline
+publication leaves mismatching copies unusable; it does not bypass transaction
+recovery. Baseline content travels through the typed helper protocol, separately
+from rsync; preview reports its UTF-8 content size separately from rsync wire
+statistics. The helper protocol is now version 5.
+
 ## Safety model
 
 - Remote reads use an explicit rsync allowlist.
@@ -285,6 +319,9 @@ verified transaction whose final journal cleanup was interrupted is cleared
 automatically.
 
 ## Development
+
+The Unix CLI integration test needs `python3` and `rsync` on `PATH`. It uses
+a local SSH stand-in and temporary homes; it never connects to a live peer.
 
 ```console
 cargo fmt --check

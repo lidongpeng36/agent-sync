@@ -6,6 +6,7 @@ use crate::core::{
     inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
     seed_remote_deltas, stamp,
 };
+use crate::memory_merge::{self, Baseline, Endpoint, Scope};
 use crate::remote::{BackupKind, Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
 use anyhow::{Context, Result, bail};
@@ -63,6 +64,48 @@ pub struct CodexPrepared {
     state_root: PathBuf,
     local_node_id: String,
     remote_node_id: String,
+    memory_basis: Option<Box<MemoryBasis>>,
+}
+
+struct MemoryBasis {
+    scope: Scope,
+    local: Option<Baseline>,
+    remote: Option<Baseline>,
+}
+
+fn memory_basis(
+    local: &Path,
+    remote_root: &str,
+    transport: &SshTransport,
+    local_node: &str,
+    remote_node: &str,
+    resources: ResourceSelection,
+) -> Result<MemoryBasis> {
+    let peer = Endpoint::new(local_node.to_owned(), local)?;
+    let view: memory_merge::View =
+        transport.remote_request(&RemoteRequest::CodexMemoryBaseline {
+            root: remote_root.to_owned(),
+            peer: peer.clone(),
+            resources,
+        })?;
+    let other = view
+        .scope
+        .endpoints
+        .iter()
+        .find(|e| **e != peer)
+        .context("memory baseline lacks remote endpoint")?;
+    if !view.scope.endpoints.contains(&peer)
+        || other.node != remote_node
+        || view.scope.resources != resources
+    {
+        bail!("memory baseline scope differs from selected endpoints");
+    }
+    let local = memory_merge::load(&memory_merge::storage_root()?, &view.scope)?;
+    Ok(MemoryBasis {
+        scope: view.scope,
+        local,
+        remote: view.baseline,
+    })
 }
 
 pub(super) fn print_diff(prepared: &CodexPrepared, local: &Path) -> Result<()> {
@@ -126,6 +169,21 @@ impl Adapter for CodexAdapter {
         let state_root = crate::state::state_root(options)?;
         let local_node_id = crate::state::node_id(&state_root)?;
         let remote_node_id = transport.remote_node_id()?;
+        let memory_basis = if options.resources.memory() {
+            Some(Box::new(memory_basis(
+                local,
+                remote_root,
+                transport,
+                &local_node_id,
+                &remote_node_id,
+                options.resources,
+            )?))
+        } else {
+            None
+        };
+        let common_base = memory_basis
+            .as_ref()
+            .and_then(|b| memory_merge::common(b.local.as_ref(), b.remote.as_ref()));
         let previous =
             crate::state::load(&state_root, "codex", &transport.host, options.resources)?;
         let (local_inventory, reused) = inventory_cached(
@@ -152,7 +210,7 @@ impl Adapter for CodexAdapter {
         let transfer_stats = transport.pull_files(remote_root, &remote, &transfer)?;
         complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
         drop(scan_guard);
-        let (mut report, metadata, conflicts) = build_stage(
+        let (mut report, metadata, conflicts) = build_stage_with_base(
             local,
             &remote,
             &stage,
@@ -160,7 +218,16 @@ impl Adapter for CodexAdapter {
             &active,
             &transport.host,
             options.conflict_strategy,
+            common_base.as_ref(),
         )?;
+        if let Some(basis) = &memory_basis {
+            let bytes = basis
+                .remote
+                .as_ref()
+                .map(|b| b.files.values().map(String::len).sum::<usize>())
+                .unwrap_or(0);
+            report.notes.push(format!("memory baseline: remote UTF-8 content={bytes} bytes via typed RPC (separate from rsync statistics)"));
+        }
         let transferred_bytes = remote_inventory
             .entries
             .iter()
@@ -210,6 +277,7 @@ impl Adapter for CodexAdapter {
             state_root,
             local_node_id,
             remote_node_id,
+            memory_basis,
         }))
     }
 
@@ -286,6 +354,22 @@ impl Adapter for CodexAdapter {
             value.resources,
         )?;
         transport.ensure_no_pending_transaction(&value.state_root, "codex")?;
+        if let Some(previous) = &value.memory_basis {
+            let current = memory_basis(
+                local,
+                remote_root,
+                transport,
+                &value.local_node_id,
+                &value.remote_node_id,
+                value.resources,
+            )?;
+            if current.scope != previous.scope
+                || current.local != previous.local
+                || current.remote != previous.remote
+            {
+                bail!("Codex memory baseline changed after preview; rerun sync");
+            }
+        }
         let _guard = if value.resources.sessions() {
             Some(CodexGuards::acquire(local, remote_root, transport)?)
         } else {
@@ -400,6 +484,28 @@ impl Adapter for CodexAdapter {
                 "warning: skipped active Codex sessions {}; history/index and catalog repair deferred",
                 value.active.iter().cloned().collect::<Vec<_>>().join(",")
             );
+        }
+        if let Some(basis) = &value.memory_basis {
+            let baseline = Baseline::capture_excluding(
+                basis.scope.clone(),
+                journal.transaction_id.clone(),
+                &value.stage,
+                &value.active,
+            )?;
+            let actual = Baseline::capture_excluding(
+                basis.scope.clone(),
+                journal.transaction_id.clone(),
+                local,
+                &value.active,
+            )?;
+            if actual != baseline {
+                bail!("local memory baseline differs from verified result");
+            }
+            let _: Value = transport.remote_request(&RemoteRequest::SaveCodexMemoryBaseline {
+                root: remote_root.to_owned(),
+                baseline: baseline.clone(),
+            })?;
+            memory_merge::save_verified(&memory_merge::storage_root()?, &baseline, &journal)?;
         }
         let final_inventory = inventory(local, exclude)?;
         let local_checkpoint = crate::state::Checkpoint::new(
@@ -680,6 +786,7 @@ fn uuid7_ms(id: &str) -> Option<i64> {
     )
 }
 
+#[cfg(test)]
 fn build_stage(
     local: &Path,
     remote: &Path,
@@ -688,6 +795,20 @@ fn build_stage(
     active: &BTreeSet<String>,
     peer: &str,
     strategy: ConflictStrategy,
+) -> Result<(PlanReport, BTreeMap<String, Times>, Vec<CodexConflict>)> {
+    build_stage_with_base(local, remote, stage, r, active, peer, strategy, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stage_with_base(
+    local: &Path,
+    remote: &Path,
+    stage: &Path,
+    r: ResourceSelection,
+    active: &BTreeSet<String>,
+    peer: &str,
+    strategy: ConflictStrategy,
+    baseline: Option<&Baseline>,
 ) -> Result<(PlanReport, BTreeMap<String, Times>, Vec<CodexConflict>)> {
     let mut report = PlanReport {
         agent: "codex".into(),
@@ -790,7 +911,15 @@ fn build_stage(
     }
     if r.memory() {
         report.resources.push("memory".into());
-        merge_codex_memory(local, remote, stage, &mut report, strategy, &mut conflicts)?;
+        merge_codex_memory(
+            local,
+            remote,
+            stage,
+            &mut report,
+            strategy,
+            &mut conflicts,
+            baseline,
+        )?;
     }
     Ok((report, metadata, conflicts))
 }
@@ -843,7 +972,11 @@ fn merge_codex_memory(
     report: &mut PlanReport,
     strategy: ConflictStrategy,
     conflicts: &mut Vec<CodexConflict>,
+    baseline: Option<&Baseline>,
 ) -> Result<()> {
+    if baseline.is_none() {
+        report.notes.push("memory: no matching verified baseline; differing files require a choice; successful apply establishes a baseline".into());
+    }
     let a = local.join("memories");
     let b = remote.join("memories");
     let paths = memory_paths(&a)?
@@ -869,32 +1002,30 @@ fn merge_codex_memory(
                 if lb == rb {
                     report.identical += 1;
                     copy(&l, &out)?
-                } else if rel == Path::new("raw_memories.md") {
-                    fs::create_dir_all(out.parent().unwrap())?;
-                    fs::write(
-                        out,
-                        merge_blocks(
-                            &String::from_utf8(lb)?,
-                            &String::from_utf8(rb)?,
-                            "## Thread: ",
-                        ),
-                    )?
-                } else if rel == Path::new("MEMORY.md") {
-                    fs::create_dir_all(out.parent().unwrap())?;
-                    fs::write(
-                        out,
-                        merge_blocks(&String::from_utf8(lb)?, &String::from_utf8(rb)?, "### "),
-                    )?
-                } else if rel == Path::new("memory_summary.md") {
-                    fs::create_dir_all(out.parent().unwrap())?;
-                    fs::write(
-                        out,
-                        format!(
-                            "# Synchronized memory\n\n## Local view\n\n{}\n## Remote view\n\n{}",
-                            String::from_utf8(lb)?,
-                            String::from_utf8(rb)?
-                        ),
-                    )?
+                } else if let Some(merged) = baseline
+                    .and_then(|b| {
+                        b.files.get(
+                            &Path::new("memories")
+                                .join(&rel)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    })
+                    .and_then(|base| {
+                        memory_merge::merge(
+                            base,
+                            std::str::from_utf8(&lb).ok()?,
+                            std::str::from_utf8(&rb).ok()?,
+                        )
+                    })
+                {
+                    private_dir(out.parent().unwrap())?;
+                    fs::write(&out, merged)?;
+                    report.advances += 1;
+                    report.notes.push(format!(
+                        "memory three-way merge: memories/{}",
+                        rel.display()
+                    ));
                 } else {
                     match strategy {
                         ConflictStrategy::Local => copy(&l, &out)?,
@@ -911,7 +1042,19 @@ fn merge_codex_memory(
                             report.blockers.push(Blocker {
                                 resource: "memory".into(),
                                 path: rel.display().to_string(),
-                                reason: "Codex memory leaf requires a choice".into(),
+                                reason: format!(
+                                    "Codex memory requires a choice: {}",
+                                    if baseline.is_some_and(|b| b.files.contains_key(
+                                        &Path::new("memories")
+                                            .join(&rel)
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    )) {
+                                        "overlapping edits or non-text content"
+                                    } else {
+                                        "no shared verified content baseline"
+                                    }
+                                ),
                             })
                         }
                     }
@@ -951,45 +1094,6 @@ fn copy(a: &Path, b: &Path) -> Result<()> {
     fs::copy(a, b)?;
     Ok(())
 }
-fn merge_blocks(a: &str, b: &str, heading: &str) -> String {
-    let mut preamble = String::new();
-    let mut blocks: BTreeMap<String, String> = BTreeMap::new();
-    for text in [a, b] {
-        let mut current = String::new();
-        for line in text.lines() {
-            if line.starts_with(heading) {
-                if !current.is_empty() {
-                    let key = current.lines().next().unwrap_or("").to_owned();
-                    if blocks.get(&key).map(String::len).unwrap_or(0) < current.len() {
-                        blocks.insert(key, current.clone());
-                    }
-                }
-                current.clear();
-            }
-            if current.is_empty() && !line.starts_with(heading) {
-                if preamble.is_empty() {
-                    preamble.push_str(line);
-                    preamble.push('\n')
-                }
-            } else {
-                current.push_str(line);
-                current.push('\n')
-            }
-        }
-        if !current.is_empty() {
-            let key = current.lines().next().unwrap_or("").to_owned();
-            if blocks.get(&key).map(String::len).unwrap_or(0) < current.len() {
-                blocks.insert(key, current);
-            }
-        }
-    }
-    format!(
-        "{}\n{}",
-        preamble.trim_end(),
-        blocks.into_values().collect::<Vec<_>>().join("\n")
-    )
-}
-
 fn active_writer_ids(local: &Path, remote: &str, t: &SshTransport) -> Result<BTreeSet<String>> {
     let mut s = local_active_writer_ids(local)?;
     let remote_ids: Vec<String> = t.remote_request(&RemoteRequest::CodexActiveWriters {
@@ -1547,14 +1651,106 @@ mod tests {
     }
 
     #[test]
-    fn memory_block_merge_prefers_richer_duplicate() {
-        let merged = merge_blocks(
-            "# Memory\n\n## Thread: abc\nshort\n",
-            "# Memory\n\n## Thread: abc\nlonger details\n",
-            "## Thread: ",
+    fn separate_conversation_files_are_additive_even_with_similar_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        let first = "memories/rollout_summaries/conversation-a.md";
+        let second = "memories/rollout_summaries/conversation-b.md";
+        for root in [&local, &remote] {
+            fs::create_dir_all(root.join("memories/rollout_summaries")).unwrap();
+        }
+        let first_text = "# 服务维护\n- 主机 A 配置变更后 reload。\n";
+        let second_text = "# 服务维护\n- 主机 B 配置变更后 reload。\n";
+        fs::write(local.join(first), first_text).unwrap();
+        fs::write(remote.join(second), second_text).unwrap();
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "fixture",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+        assert!(conflicts.is_empty());
+        assert!(report.blockers.is_empty());
+        assert_eq!((report.local_additions, report.remote_additions), (1, 1));
+        assert_eq!(fs::read_to_string(stage.join(first)).unwrap(), first_text);
+        assert_eq!(fs::read_to_string(stage.join(second)).unwrap(), second_text);
+        assert!(!local.join(second).exists());
+        assert!(!remote.join(first).exists());
+    }
+
+    #[test]
+    fn same_path_without_baseline_does_not_infer_conversation_identity_from_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let stage = temp.path().join("stage");
+        for root in [&local, &remote] {
+            fs::create_dir_all(root.join("memories")).unwrap();
+        }
+        fs::write(
+            local.join("memories/MEMORY.md"),
+            "# 网络\n配置变更后 reload。\n",
+        )
+        .unwrap();
+        fs::write(
+            remote.join("memories/MEMORY.md"),
+            "# 字幕\n检查完整影片时间轴。\n",
+        )
+        .unwrap();
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "fixture",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            report.blockers[0]
+                .reason
+                .contains("no shared verified content baseline")
         );
-        assert!(merged.contains("longer details"));
-        assert!(!merged.contains("\nshort\n"));
+        assert!(!stage.join("memories/MEMORY.md").exists());
+    }
+
+    #[test]
+    fn aggregate_markdown_without_base_requires_choice_instead_of_discarding_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        for root in [&local, &remote] {
+            fs::create_dir_all(root.join("memories")).unwrap();
+        }
+        for name in ["MEMORY.md", "raw_memories.md", "memory_summary.md"] {
+            fs::write(local.join("memories").join(name), "# Memory\nlocal rule\n").unwrap();
+            fs::write(
+                remote.join("memories").join(name),
+                "# Memory\nlonger remote rule\n",
+            )
+            .unwrap();
+        }
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &temp.path().join("stage"),
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "mini",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+        assert_eq!(conflicts.len(), 3);
+        assert_eq!(report.blockers.len(), 3);
+        assert!(!temp.path().join("stage/memories/MEMORY.md").exists());
     }
 
     #[test]
