@@ -92,6 +92,22 @@ fn codex_memory_three_way_transaction_converges_and_failed_apply_keeps_base() {
     use std::path::Path;
 
     let temp = tempfile::tempdir().unwrap();
+    // Memory-only sync probes Codex's presence but must never invoke a real agent.
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo codex-test; else exit 99; fi\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let test_path = std::env::join_paths(paths).unwrap();
     let local_home = temp.path().join("local");
     let remote_home = temp.path().join("remote");
     let local = local_home.join("codex");
@@ -110,6 +126,7 @@ fn codex_memory_three_way_transaction_converges_and_failed_apply_keeps_base() {
         };
         let mut command = Command::cargo_bin("agent-sync").unwrap();
         command
+            .env("PATH", &test_path)
             .env("HOME", local_home)
             .env("XDG_CACHE_HOME", local_home.join(".cache"))
             .env("XDG_DATA_HOME", local_home.join(".local/share"))
