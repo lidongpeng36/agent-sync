@@ -36,6 +36,7 @@ struct Times {
 struct Session {
     relative: PathBuf,
     lines: Vec<Vec<u8>>,
+    record_hashes: Vec<String>,
     times: Times,
 }
 
@@ -65,6 +66,9 @@ pub struct CodexPrepared {
     local_node_id: String,
     remote_node_id: String,
     memory_basis: Option<Box<MemoryBasis>>,
+    merge_config: crate::memory_resolver::MergeConfig,
+    memory_reviewed: bool,
+    memory_evidence: [PathBuf; 2],
 }
 
 struct MemoryBasis {
@@ -134,7 +138,7 @@ impl Adapter for CodexAdapter {
         if !local.exists() {
             bail!("Codex root does not exist: {}", local.display());
         }
-        for command in [&transport.ssh, &transport.rsync, "codex"] {
+        for command in [&transport.ssh, &transport.rsync] {
             if !SshTransport::command_exists(command) {
                 bail!("required local command not found: {command}");
             }
@@ -210,7 +214,17 @@ impl Adapter for CodexAdapter {
         let transfer_stats = transport.pull_files(remote_root, &remote, &transfer)?;
         complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
         drop(scan_guard);
-        let (mut report, metadata, conflicts) = build_stage_with_base(
+        let memory_evidence = [
+            temp.path().join("evidence-local"),
+            temp.path().join("evidence-remote"),
+        ];
+        if options.resources.memory()
+            && options.memory_merge.backend != crate::memory_resolver::Backend::Builtin
+        {
+            snapshot_memory_evidence(local, &local_inventory, &memory_evidence[0])?;
+            snapshot_memory_evidence(&remote, &remote_inventory, &memory_evidence[1])?;
+        }
+        let (mut report, metadata, conflicts) = build_stage_with_merge_config(
             local,
             &remote,
             &stage,
@@ -219,6 +233,18 @@ impl Adapter for CodexAdapter {
             &transport.host,
             options.conflict_strategy,
             common_base.as_ref(),
+            &options.memory_merge,
+        )?;
+        let memory_reviewed = review_staged_memory(
+            &stage,
+            options.resources,
+            options.conflict_strategy,
+            &options.memory_merge,
+            common_base.as_ref(),
+            &active,
+            &BTreeSet::new(),
+            &[&memory_evidence[0], &memory_evidence[1]],
+            &mut report,
         )?;
         if let Some(basis) = &memory_basis {
             let bytes = basis
@@ -278,6 +304,9 @@ impl Adapter for CodexAdapter {
             local_node_id,
             remote_node_id,
             memory_basis,
+            merge_config: options.memory_merge.clone(),
+            memory_reviewed,
+            memory_evidence,
         }))
     }
 
@@ -289,6 +318,7 @@ impl Adapter for CodexAdapter {
             return Ok(());
         }
         let mut edited = BTreeSet::new();
+        let mut protected = BTreeSet::new();
         for conflict in value.conflicts.clone() {
             let choice = choose_interactively(
                 &format!("Codex {} conflict [{}]", conflict.resource, conflict.key),
@@ -310,6 +340,7 @@ impl Adapter for CodexAdapter {
                 InteractiveChoice::Edited(bytes) => (conflict.local_relative.clone(), bytes, true),
             };
             stage_codex_choice(value, &conflict, &relative, &bytes)?;
+            protected.insert(relative.to_string_lossy().into_owned());
             if was_edited {
                 edited.insert(relative.to_string_lossy().into_owned());
             }
@@ -318,6 +349,27 @@ impl Adapter for CodexAdapter {
             .report
             .blockers
             .retain(|blocker| !blocker.reason.contains("requires a choice"));
+        if !value.memory_reviewed {
+            value
+                .report
+                .blockers
+                .retain(|b| b.resource != "memory-consistency");
+            let base = value
+                .memory_basis
+                .as_ref()
+                .and_then(|b| memory_merge::common(b.local.as_ref(), b.remote.as_ref()));
+            value.memory_reviewed = review_staged_memory(
+                &value.stage,
+                value.resources,
+                ConflictStrategy::Ask,
+                &value.merge_config,
+                base.as_ref(),
+                &value.active,
+                &protected,
+                &[&value.memory_evidence[0], &value.memory_evidence[1]],
+                &mut value.report,
+            )?;
+        }
         value.report.files = planned_file_changes(
             &value.local_root,
             &value.remote_view,
@@ -403,8 +455,12 @@ impl Adapter for CodexAdapter {
             bail!("remote Codex data changed after preview");
         }
         if value.resources.sessions() && value.active.is_empty() {
-            reconcile_catalog(None, false)?;
-            reconcile_catalog(Some(transport), false)?;
+            if !SshTransport::command_exists("codex") {
+                bail!(
+                    "Codex session apply requires codex for catalog repair; memory-only sync does not"
+                );
+            }
+            let _: Value = transport.remote_request(&RemoteRequest::CodexRuntime)?;
         }
         let local_payload = value.temp.path().join("local-payload");
         let remote_payload = value.temp.path().join("remote-payload");
@@ -446,6 +502,25 @@ impl Adapter for CodexAdapter {
         transport.push(&remote_payload, remote_root)?;
         journal.phase = crate::state::TransactionPhase::RemoteApplied;
         transport.save_transaction_pair(&value.state_root, &journal)?;
+        if value.resources.sessions() && value.active.is_empty() {
+            let ids: Vec<String> = value.metadata.keys().cloned().collect();
+            let local_count = reconcile_catalog(local, &ids)?;
+            let remote_count: usize = transport.remote_request(&RemoteRequest::CodexCatalog {
+                root: remote_root.to_owned(),
+                ids,
+            })?;
+            let local_changed = repair_state(local, &value.metadata)?;
+            let remote_changed = remote_state(
+                transport,
+                remote_root,
+                &stamp,
+                "repair",
+                Some(&value.metadata),
+            )?;
+            println!(
+                "catalog: local={local_count}, remote={remote_count}; times repaired: local={local_changed}, remote={remote_changed}"
+            );
+        }
         verify_selected(&value.stage, local, value.resources, &value.active, "local")?;
         let verified_remote: crate::core::Inventory =
             transport.remote_request(&RemoteRequest::Inventory {
@@ -463,22 +538,6 @@ impl Adapter for CodexAdapter {
         )?;
         journal.phase = crate::state::TransactionPhase::Verified;
         transport.save_transaction_pair(&value.state_root, &journal)?;
-        drop(_guard);
-        if value.resources.sessions() && value.active.is_empty() {
-            let local_count = reconcile_catalog(None, true)?;
-            let remote_count = reconcile_catalog(Some(transport), true)?;
-            let local_changed = repair_state(local, &value.metadata)?;
-            let remote_changed = remote_state(
-                transport,
-                remote_root,
-                &stamp,
-                "repair",
-                Some(&value.metadata),
-            )?;
-            println!(
-                "catalog: local={local_count}, remote={remote_count}; times repaired: local={local_changed}, remote={remote_changed}"
-            );
-        }
         if !value.active.is_empty() {
             println!(
                 "warning: skipped active Codex sessions {}; history/index and catalog repair deferred",
@@ -486,18 +545,23 @@ impl Adapter for CodexAdapter {
             );
         }
         if let Some(basis) = &value.memory_basis {
-            let baseline = Baseline::capture_excluding(
+            let mut baseline = Baseline::capture_excluding(
                 basis.scope.clone(),
                 journal.transaction_id.clone(),
                 &value.stage,
                 &value.active,
             )?;
-            let actual = Baseline::capture_excluding(
+            let mut actual = Baseline::capture_excluding(
                 basis.scope.clone(),
                 journal.transaction_id.clone(),
                 local,
                 &value.active,
             )?;
+            if value.memory_reviewed {
+                let policy = Some(crate::memory_consistency::POLICY.to_owned());
+                baseline.set_review_policy(policy.clone())?;
+                actual.set_review_policy(policy)?;
+            }
             if actual != baseline {
                 bail!("local memory baseline differs from verified result");
             }
@@ -527,6 +591,7 @@ impl Adapter for CodexAdapter {
         })?;
         crate::state::save(&value.state_root, &local_checkpoint)?;
         transport.clear_transaction_pair(&value.state_root, &journal)?;
+        drop(_guard);
         for message in transport.prune_backup_pair(
             local,
             remote_root,
@@ -603,10 +668,7 @@ fn stage_codex_choice(
         let times = validate_session_choice(relative, &conflict.key, bytes)?;
         filetime::set_file_mtime(
             &target,
-            filetime::FileTime::from_unix_time(
-                times.updated_at_ms / 1000,
-                ((times.updated_at_ms % 1000) * 1_000_000) as u32,
-            ),
+            filetime::FileTime::from_unix_time(times.updated_at_ms / 1000, 0),
         )?;
         prepared.metadata.insert(conflict.key.clone(), times);
     }
@@ -673,6 +735,7 @@ fn scan_sessions(root: &Path, active: &BTreeSet<String>) -> Result<BTreeMap<Stri
                     id.clone(),
                     Session {
                         relative: rel,
+                        record_hashes: semantic_record_hashes(&lines)?,
                         lines,
                         times,
                     },
@@ -698,6 +761,28 @@ fn split_lines(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         bail!("Codex JSONL must end with newline")
     }
     Ok(out)
+}
+
+// Compare the complete record, including ordinals, times, tool results and unknown
+// fields. Only the known empty default in a settings event is representation-only.
+// Keep source bytes for staging and final verification; this is not a serializer.
+fn semantic_record_hashes(lines: &[Vec<u8>]) -> Result<Vec<String>> {
+    lines
+        .iter()
+        .map(|line| {
+            let mut record: Value = serde_json::from_slice(line)?;
+            if record["type"] == "event_msg"
+                && record.pointer("/payload/type") == Some(&json!("thread_settings_applied"))
+                && let Some(settings) = record
+                    .pointer_mut("/payload/thread_settings")
+                    .and_then(Value::as_object_mut)
+                && settings.get("disabled_plugin_ids") == Some(&json!([]))
+            {
+                settings.remove("disabled_plugin_ids");
+            }
+            Ok(bytes_sha256(&serde_json::to_vec(&record)?))
+        })
+        .collect()
 }
 fn validate_rollout(path: &Path, lines: &[Vec<u8>]) -> Result<(String, Times)> {
     let first: Value = serde_json::from_slice(lines.first().context("empty rollout")?)?;
@@ -801,6 +886,7 @@ fn build_stage(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_stage_with_base(
     local: &Path,
     remote: &Path,
@@ -810,6 +896,31 @@ fn build_stage_with_base(
     peer: &str,
     strategy: ConflictStrategy,
     baseline: Option<&Baseline>,
+) -> Result<(PlanReport, BTreeMap<String, Times>, Vec<CodexConflict>)> {
+    build_stage_with_merge_config(
+        local,
+        remote,
+        stage,
+        r,
+        active,
+        peer,
+        strategy,
+        baseline,
+        &crate::memory_resolver::MergeConfig::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stage_with_merge_config(
+    local: &Path,
+    remote: &Path,
+    stage: &Path,
+    r: ResourceSelection,
+    active: &BTreeSet<String>,
+    peer: &str,
+    strategy: ConflictStrategy,
+    baseline: Option<&Baseline>,
+    merge_config: &crate::memory_resolver::MergeConfig,
 ) -> Result<(PlanReport, BTreeMap<String, Times>, Vec<CodexConflict>)> {
     let mut report = PlanReport {
         agent: "codex".into(),
@@ -836,15 +947,16 @@ fn build_stage_with_base(
                     });
                     continue;
                 }
-                (Some(x), Some(y)) if x.lines == y.lines => {
+                (Some(x), Some(y)) if x.record_hashes == y.record_hashes => {
                     report.identical += 1;
-                    x
+                    // Stable across endpoint order, without inventing rollout bytes.
+                    if x.lines <= y.lines { x } else { y }
                 }
-                (Some(x), Some(y)) if prefix(&x.lines, &y.lines) => {
+                (Some(x), Some(y)) if prefix(&x.record_hashes, &y.record_hashes) => {
                     report.advances += 1;
                     y
                 }
-                (Some(x), Some(y)) if prefix(&y.lines, &x.lines) => {
+                (Some(x), Some(y)) if prefix(&y.record_hashes, &x.record_hashes) => {
                     report.advances += 1;
                     x
                 }
@@ -883,10 +995,7 @@ fn build_stage_with_base(
             fs::write(&dst, selected.lines.concat())?;
             filetime::set_file_mtime(
                 &dst,
-                filetime::FileTime::from_unix_time(
-                    selected.times.updated_at_ms / 1000,
-                    ((selected.times.updated_at_ms % 1000) * 1_000_000) as u32,
-                ),
+                filetime::FileTime::from_unix_time(selected.times.updated_at_ms / 1000, 0),
             )?;
             metadata.insert(id, selected.times.clone());
         }
@@ -920,11 +1029,12 @@ fn build_stage_with_base(
             strategy,
             &mut conflicts,
             baseline,
+            merge_config,
         )?;
     }
     Ok((report, metadata, conflicts))
 }
-fn prefix(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {
+fn prefix<T: PartialEq>(a: &[T], b: &[T]) -> bool {
     a.len() < b.len() && a.iter().zip(b).all(|(x, y)| x == y)
 }
 fn merge_json_file(a: &Path, b: &Path, out: &Path, key: Option<&str>) -> Result<()> {
@@ -963,9 +1073,93 @@ fn merge_json_file(a: &Path, b: &Path, out: &Path, key: Option<&str>) -> Result<
         text.push('\n')
     }
     fs::write(out, text)?;
+    // Protocol 29 rsync transfers whole-second mtimes. Preserve a stable time
+    // for aggregate files instead of manufacturing a metadata update each run.
+    let seconds = [a, b]
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|meta| filetime::FileTime::from_last_modification_time(&meta).unix_seconds())
+        .max()
+        .unwrap_or(0);
+    filetime::set_file_mtime(out, filetime::FileTime::from_unix_time(seconds, 0))?;
     Ok(())
 }
 
+fn snapshot_memory_evidence(
+    source: &Path,
+    inventory: &crate::core::Inventory,
+    target: &Path,
+) -> Result<()> {
+    private_dir(target)?;
+    for entry in &inventory.entries {
+        let relative = Path::new(&entry.path);
+        if !memory_merge::eligible(relative) {
+            continue;
+        }
+        let destination = target.join(relative);
+        crate::core::copy_file_atomic(&source.join(relative), &destination)?;
+        if crate::core::sha256(&destination)? != entry.sha256 {
+            bail!("memory evidence changed during snapshot; rerun preview");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_staged_memory(
+    stage: &Path,
+    resources: ResourceSelection,
+    strategy: ConflictStrategy,
+    config: &crate::memory_resolver::MergeConfig,
+    base: Option<&Baseline>,
+    active: &BTreeSet<String>,
+    protected: &BTreeSet<String>,
+    evidence_roots: &[&Path],
+    report: &mut PlanReport,
+) -> Result<bool> {
+    if !resources.memory()
+        || strategy != ConflictStrategy::Ask
+        || config.backend == crate::memory_resolver::Backend::Builtin
+        || report.blockers.iter().any(|b| b.resource == "memory")
+    {
+        return Ok(false);
+    }
+    match crate::memory_consistency::review_with_protected(
+        stage,
+        config,
+        base,
+        active,
+        protected,
+        evidence_roots,
+    ) {
+        Ok(review) => {
+            report.notes.extend(review.notes);
+            if review.corrected > 0 {
+                report
+                    .notes
+                    .push("cross-file evidence corrections are included in the staged diff".into());
+            }
+            if let Some(reason) = review.blocker {
+                report.blockers.push(Blocker {
+                    resource: "memory-consistency".into(),
+                    path: "memories".into(),
+                    reason,
+                });
+            }
+            Ok(review.checked)
+        }
+        Err(error) => {
+            report.blockers.push(Blocker {
+                resource: "memory-consistency".into(),
+                path: "memories".into(),
+                reason: format!("cross-file consistency review failed: {error}"),
+            });
+            Ok(false)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn merge_codex_memory(
     local: &Path,
     remote: &Path,
@@ -974,9 +1168,10 @@ fn merge_codex_memory(
     strategy: ConflictStrategy,
     conflicts: &mut Vec<CodexConflict>,
     baseline: Option<&Baseline>,
+    config: &crate::memory_resolver::MergeConfig,
 ) -> Result<()> {
     if baseline.is_none() {
-        report.notes.push("memory: no matching verified baseline; differing files require a choice; successful apply establishes a baseline".into());
+        report.notes.push("memory: no matching verified baseline; builtin merge accepts only independent unchanged sections; configured semantic backend can review other differences".into());
     }
     let a = local.join("memories");
     let b = remote.join("memories");
@@ -991,73 +1186,94 @@ fn merge_codex_memory(
         match (l.exists(), r.exists()) {
             (true, false) => {
                 report.remote_additions += 1;
-                copy(&l, &out)?
+                copy(&l, &out)?;
             }
             (false, true) => {
                 report.local_additions += 1;
-                copy(&r, &out)?
+                copy(&r, &out)?;
             }
             (true, true) => {
                 let lb = fs::read(&l)?;
                 let rb = fs::read(&r)?;
                 if lb == rb {
                     report.identical += 1;
-                    copy(&l, &out)?
-                } else if let Some(merged) = baseline
-                    .and_then(|b| {
-                        b.files.get(
-                            &Path::new("memories")
-                                .join(&rel)
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
-                    })
-                    .and_then(|base| {
-                        memory_merge::merge(
-                            base,
-                            std::str::from_utf8(&lb).ok()?,
-                            std::str::from_utf8(&rb).ok()?,
-                        )
-                    })
-                {
-                    private_dir(out.parent().unwrap())?;
-                    fs::write(&out, merged)?;
-                    report.advances += 1;
-                    report.notes.push(format!(
-                        "memory three-way merge: memories/{}",
-                        rel.display()
-                    ));
+                    copy(&l, &out)?;
+                    continue;
+                }
+                let relative = Path::new("memories").join(&rel);
+                let base = baseline.and_then(|b| b.files.get(relative.to_string_lossy().as_ref()));
+                let mut merged = None;
+                let mut reason = if base.is_some() {
+                    "overlapping edits or non-text content".to_owned()
                 } else {
-                    match strategy {
-                        ConflictStrategy::Local => copy(&l, &out)?,
-                        ConflictStrategy::Remote => copy(&r, &out)?,
-                        ConflictStrategy::Ask => {
-                            conflicts.push(CodexConflict {
-                                resource: "memory",
-                                key: rel.display().to_string(),
-                                local_relative: Path::new("memories").join(&rel),
-                                remote_relative: Path::new("memories").join(&rel),
-                                local_bytes: lb,
-                                remote_bytes: rb,
-                            });
-                            report.blockers.push(Blocker {
-                                resource: "memory".into(),
-                                path: rel.display().to_string(),
-                                reason: format!(
-                                    "Codex memory requires a choice: {}",
-                                    if baseline.is_some_and(|b| b.files.contains_key(
-                                        &Path::new("memories")
-                                            .join(&rel)
-                                            .to_string_lossy()
-                                            .into_owned()
-                                    )) {
-                                        "overlapping edits or non-text content"
-                                    } else {
-                                        "no shared verified content baseline"
-                                    }
-                                ),
-                            })
+                    "no shared verified content baseline; shared sections differ".to_owned()
+                };
+                if memory_merge::eligible(&relative)
+                    && let (Ok(left), Ok(right)) =
+                        (std::str::from_utf8(&lb), std::str::from_utf8(&rb))
+                {
+                    // Explicit local/remote policies never launch an optional backend.
+                    let builtin = crate::memory_resolver::MergeConfig::default();
+                    let selected = if strategy == ConflictStrategy::Ask {
+                        config
+                    } else {
+                        &builtin
+                    };
+                    match crate::memory_resolver::resolve(
+                        selected,
+                        &relative,
+                        base.map(String::as_str),
+                        left,
+                        right,
+                    ) {
+                        Ok(result) => {
+                            merged = result.text;
+                            if let Some(message) = result.reason {
+                                reason = message;
+                            }
                         }
+                        Err(error) => {
+                            reason = format!("{} backend failed: {error}", selected.backend.name());
+                        }
+                    }
+                }
+                if let Some(text) = merged {
+                    private_dir(out.parent().context("memory path has no parent")?)?;
+                    fs::write(&out, text)?;
+                    report.advances += 1;
+                    let backend = if strategy == ConflictStrategy::Ask {
+                        config.backend
+                    } else {
+                        crate::memory_resolver::Backend::Builtin
+                    };
+                    let mode =
+                        if backend == crate::memory_resolver::Backend::Builtin && base.is_some() {
+                            "three-way"
+                        } else {
+                            backend.name()
+                        };
+                    report
+                        .notes
+                        .push(format!("memory {mode} merge: {}", relative.display()));
+                    continue;
+                }
+                match strategy {
+                    ConflictStrategy::Local => copy(&l, &out)?,
+                    ConflictStrategy::Remote => copy(&r, &out)?,
+                    ConflictStrategy::Ask => {
+                        conflicts.push(CodexConflict {
+                            resource: "memory",
+                            key: rel.display().to_string(),
+                            local_relative: relative.clone(),
+                            remote_relative: relative,
+                            local_bytes: lb,
+                            remote_bytes: rb,
+                        });
+                        report.blockers.push(Blocker {
+                            resource: "memory".into(),
+                            path: rel.display().to_string(),
+                            reason: format!("Codex memory requires a choice: {reason}"),
+                        });
                     }
                 }
             }
@@ -1066,6 +1282,7 @@ fn merge_codex_memory(
     }
     Ok(())
 }
+
 fn memory_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut s = BTreeSet::new();
     if root.exists() {
@@ -1226,6 +1443,7 @@ fn backup_remote(
 fn install_local(stage: &Path, root: &Path, rsync: &str) -> Result<()> {
     let status = Command::new(rsync)
         .arg("-a")
+        .arg("--checksum")
         .arg(format!("{}/", stage.display()))
         .arg(format!("{}/", root.display()))
         .status()?;
@@ -1265,62 +1483,56 @@ fn verify_remote_inventory(
     Ok(())
 }
 
-fn reconcile_catalog(t: Option<&SshTransport>, scan: bool) -> Result<usize> {
-    let mut c = if let Some(t) = t {
-        let mut c = Command::new(&t.ssh);
-        c.arg(&t.host)
-            .arg("exec codex app-server --listen stdio://");
-        c
-    } else {
-        let mut c = Command::new("codex");
-        c.args(["app-server", "--listen", "stdio://"]);
-        c
-    };
-    let mut child = c
+pub(crate) fn reconcile_catalog(root: &Path, ids: &[String]) -> Result<usize> {
+    for id in ids {
+        uuid::Uuid::parse_str(id).context("invalid catalog thread id")?;
+    }
+    let mut child = Command::new("codex")
+        .args(["app-server", "--listen", "stdio://"])
+        .env("CODEX_HOME", root)
+        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Do not allow a full diagnostic pipe to deadlock the protocol.
+        .stderr(Stdio::null())
         .spawn()?;
-    let mut input = child.stdin.take().unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    rpc(
-        &mut input,
-        &mut output,
-        1,
-        "initialize",
-        json!({"clientInfo":{"name":"agent-sync","version":env!("CARGO_PKG_VERSION")}}),
-    )?;
-    let mut total = 0;
-    let mut request_id = 2;
-    for archived in [false, true] {
-        let mut cursor: Option<String> = None;
-        loop {
-            let r = rpc(
+    let result = (|| {
+        let mut input = child.stdin.take().context("missing app-server stdin")?;
+        let mut output = BufReader::new(child.stdout.take().context("missing app-server stdout")?);
+        rpc(
+            &mut input,
+            &mut output,
+            1,
+            "initialize",
+            json!({"clientInfo":{"name":"agent-sync","version":env!("CARGO_PKG_VERSION")}}),
+        )?;
+        // thread/list can omit files absent from an already backfilled database.
+        // Explicit reads discover and repair each installed rollout without resuming it.
+        for (index, id) in ids.iter().enumerate() {
+            let value = rpc(
                 &mut input,
                 &mut output,
-                request_id,
-                "thread/list",
-                json!({"archived":archived,"cursor":cursor,"limit":1000,"useStateDbOnly":!scan}),
+                index as i64 + 2,
+                "thread/read",
+                json!({"threadId":id,"includeTurns":false}),
             )?;
-            request_id += 1;
-            total += r
-                .get("data")
-                .and_then(Value::as_array)
-                .context("invalid thread/list data")?
-                .len();
-            cursor = r
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            if !scan || cursor.is_none() {
-                break;
+            if value.pointer("/thread/id").and_then(Value::as_str) != Some(id) {
+                bail!("catalog read returned a different thread id");
             }
         }
+        Ok(ids.len())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
     }
-    drop(input);
-    let _ = child.wait();
-    Ok(total)
+    let status = child.wait()?;
+    let count = result?;
+    if !status.success() {
+        bail!("Codex catalog repair failed");
+    }
+    Ok(count)
 }
+
 fn rpc(
     input: &mut ChildStdin,
     output: &mut BufReader<ChildStdout>,
@@ -1435,6 +1647,103 @@ mod tests {
     fn prefix_is_strict() {
         assert!(prefix(&[b"a".to_vec()], &[b"a".to_vec(), b"b".to_vec()]));
         assert!(!prefix(&[b"a".to_vec()], &[b"a".to_vec()]));
+    }
+
+    #[test]
+    fn semantic_records_preserve_unknown_fields_and_nonempty_settings() {
+        let hash = |record: Value| {
+            semantic_record_hashes(&[serde_json::to_vec(&record).unwrap()]).unwrap()
+        };
+        let record = json!({"type":"event_msg", "ordinal":2,
+            "timestamp":"2026-08-01T00:00:00Z",
+            "payload":{"type":"thread_settings_applied", "thread_settings":{}}});
+        let mut empty = record.clone();
+        empty["payload"]["thread_settings"]["disabled_plugin_ids"] = json!([]);
+        assert_eq!(hash(record.clone()), hash(empty.clone()));
+        for value in [json!(null), json!(["plugin-a"]), json!(false)] {
+            empty["payload"]["thread_settings"]["disabled_plugin_ids"] = value;
+            assert_ne!(hash(record.clone()), hash(empty.clone()));
+        }
+        for (key, value) in [
+            ("ordinal", json!(3)),
+            ("unknown", json!(true)),
+            ("timestamp", json!("2026-08-02T00:00:00Z")),
+        ] {
+            let mut changed = record.clone();
+            changed[key] = value;
+            assert_ne!(hash(record.clone()), hash(changed));
+        }
+        let mut other_event = record.clone();
+        other_event["payload"]["type"] = json!("unknown_event");
+        let mut other_empty = other_event.clone();
+        other_empty["payload"]["thread_settings"]["disabled_plugin_ids"] = json!([]);
+        assert_ne!(hash(other_event), hash(other_empty));
+    }
+
+    #[test]
+    fn semantic_session_merge_is_symmetric_append_aware_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        let lp = write_rollout(&local, id, "same");
+        let rp = write_rollout(&remote, id, "same");
+        // Valid JSONL with different key order/spacing, not pretty-printed JSON.
+        let text = fs::read_to_string(&rp)
+            .unwrap()
+            .replace("{\"type\":", "{ \"type\" : ");
+        fs::write(&rp, text).unwrap();
+        let run = |a: &Path, b: &Path, name: &str| {
+            let stage = temp.path().join(name);
+            let (report, _, conflicts) = build_stage(
+                a,
+                b,
+                &stage,
+                ResourceSelection::Sessions,
+                &BTreeSet::new(),
+                "peer",
+                ConflictStrategy::Ask,
+            )
+            .unwrap();
+            assert!(conflicts.is_empty());
+            (
+                report,
+                fs::read(stage.join(lp.strip_prefix(&local).unwrap())).unwrap(),
+            )
+        };
+        let (report, selected) = run(&local, &remote, "equal");
+        assert_eq!(report.identical, 1);
+        assert_eq!(selected, run(&remote, &local, "reverse").1);
+        let mut advanced = fs::read(&rp).unwrap();
+        advanced.extend_from_slice(
+            b"{\"type\":\"event\",\"ordinal\":2,\"payload\":{\"tool_result\":\"kept\"}}\n",
+        );
+        fs::write(&rp, &advanced).unwrap();
+        let (report, selected) = run(&local, &remote, "advance");
+        assert_eq!(report.advances, 1);
+        assert_eq!(selected, advanced);
+        assert_eq!(selected, run(&remote, &local, "reverse-advance").1);
+        fs::write(&lp, &selected).unwrap();
+        assert_eq!(run(&local, &remote, "rerun").0.identical, 1);
+        // Content differences must remain conflicts even if the tail is longer.
+        fs::write(
+            &lp,
+            String::from_utf8(selected)
+                .unwrap()
+                .replace("same", "different"),
+        )
+        .unwrap();
+        let (_, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &temp.path().join("conflict"),
+            ResourceSelection::Sessions,
+            &BTreeSet::new(),
+            "peer",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+        assert_eq!(conflicts.len(), 1);
     }
 
     #[test]
@@ -1609,6 +1918,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_memory_policy_does_not_call_configured_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        for root in [&local, &remote] {
+            fs::create_dir_all(root.join("memories")).unwrap();
+        }
+        fs::write(local.join("memories/MEMORY.md"), "# A\nlocal\n").unwrap();
+        fs::write(remote.join("memories/MEMORY.md"), "# B\nremote\n").unwrap();
+        let config = crate::memory_resolver::MergeConfig {
+            backend: crate::memory_resolver::Backend::Codex,
+            command: Some(temp.path().join("must-not-run")),
+            ..Default::default()
+        };
+        let (report, _, conflicts) = build_stage_with_merge_config(
+            &local,
+            &remote,
+            &temp.path().join("stage"),
+            ResourceSelection::Memory,
+            &BTreeSet::new(),
+            "peer",
+            ConflictStrategy::Local,
+            None,
+            &config,
+        )
+        .unwrap();
+        assert!(conflicts.is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("memory builtin merge"))
+        );
+        assert!(
+            !report
+                .notes
+                .iter()
+                .any(|n| n.contains("memory codex merge"))
+        );
+    }
+
+    #[test]
     fn codex_memory_leaf_conflict_uses_the_selected_strategy() {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
@@ -1686,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn same_path_without_baseline_does_not_infer_conversation_identity_from_text() {
+    fn same_path_without_baseline_merges_independent_markdown_sections() {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -1714,13 +2065,11 @@ mod tests {
             ConflictStrategy::Ask,
         )
         .unwrap();
-        assert_eq!(conflicts.len(), 1);
-        assert!(
-            report.blockers[0]
-                .reason
-                .contains("no shared verified content baseline")
-        );
-        assert!(!stage.join("memories/MEMORY.md").exists());
+        assert!(conflicts.is_empty());
+        assert!(report.blockers.is_empty());
+        let merged = fs::read_to_string(stage.join("memories/MEMORY.md")).unwrap();
+        assert!(merged.contains("# 网络\n配置变更后 reload。"));
+        assert!(merged.contains("# 字幕\n检查完整影片时间轴。"));
     }
 
     #[test]

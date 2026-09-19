@@ -68,6 +68,8 @@ pub struct Baseline {
     pub transaction_id: String,
     pub files: BTreeMap<String, String>,
     pub excluded_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<String>,
     checksum: String,
 }
 
@@ -139,6 +141,7 @@ impl Baseline {
             transaction_id,
             files,
             excluded_ids: excluded_ids.clone(),
+            review_policy: None,
             checksum: String::new(),
         };
         value.checksum = value.digest()?;
@@ -146,7 +149,24 @@ impl Baseline {
         Ok(value)
     }
 
+    pub fn set_review_policy(&mut self, policy: Option<String>) -> Result<()> {
+        self.review_policy = policy;
+        self.checksum = self.digest()?;
+        self.validate()
+    }
+
     fn digest(&self) -> Result<String> {
+        // Preserve the original digest for old, unreviewed baselines.
+        if let Some(policy) = &self.review_policy {
+            return Ok(bytes_sha256(&serde_json::to_vec(&(
+                self.version,
+                &self.scope,
+                &self.transaction_id,
+                &self.files,
+                &self.excluded_ids,
+                policy,
+            ))?));
+        }
         Ok(bytes_sha256(&serde_json::to_vec(&(
             self.version,
             &self.scope,
@@ -166,6 +186,10 @@ impl Baseline {
                 .files
                 .keys()
                 .any(|p| self.excluded_ids.iter().any(|id| p.contains(id)))
+            || self
+                .review_policy
+                .as_ref()
+                .is_some_and(|p| p != crate::memory_consistency::POLICY)
             || self.version != 1
             || self.transaction_id.len() != 64
             || !self.transaction_id.bytes().all(|b| b.is_ascii_hexdigit())
@@ -291,6 +315,27 @@ pub fn merge(base: &str, local: &str, remote: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_policy_is_paired_checksummed_and_old_baselines_remain_valid() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("memories")).unwrap();
+        fs::write(root.path().join("memories/MEMORY.md"), "original\n").unwrap();
+        let legacy = Baseline::capture(scope(), "f".repeat(64), root.path()).unwrap();
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("review_policy"));
+        let loaded: Baseline = serde_json::from_str(&serialized).unwrap();
+        loaded.validate().unwrap();
+        let mut reviewed = loaded.clone();
+        reviewed
+            .set_review_policy(Some(crate::memory_consistency::POLICY.into()))
+            .unwrap();
+        assert!(common(Some(&loaded), Some(&reviewed)).is_none());
+        assert!(common(Some(&reviewed), Some(&reviewed)).is_some());
+        let mut tampered = loaded.clone();
+        tampered.review_policy = reviewed.review_policy.clone();
+        assert!(tampered.validate().is_err());
+    }
 
     #[test]
     fn realistic_memory_scenarios_distinguish_text_conflicts_from_semantic_review() {

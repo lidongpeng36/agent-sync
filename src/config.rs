@@ -14,6 +14,7 @@ pub struct Config {
     default_peer: Option<String>,
     conflict_strategy: Option<ConflictStrategy>,
     backup_retention: Option<usize>,
+    memory_merge: Option<crate::memory_resolver::MergeConfig>,
     #[serde(default)]
     peers: BTreeMap<String, Peer>,
     #[serde(default)]
@@ -37,6 +38,7 @@ struct Agent {
     local_root: Option<String>,
     conflict_strategy: Option<ConflictStrategy>,
     backup_retention: Option<usize>,
+    memory_merge: Option<crate::memory_resolver::MergeConfig>,
 }
 
 fn version() -> u32 {
@@ -74,8 +76,13 @@ impl Config {
             });
         }
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let config: Self =
-            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        // TOML's Display includes the offending source line, which may be a key.
+        let config: Self = toml::from_str(&text).map_err(|_| {
+            anyhow::anyhow!(
+                "parse {}: invalid TOML or unknown configuration fields",
+                path.display()
+            )
+        })?;
         if config.version != 1 {
             bail!("unsupported config version {}", config.version);
         }
@@ -136,6 +143,18 @@ impl Config {
             .and_then(|agent| agent.conflict_strategy)
             .or(self.conflict_strategy)
             .unwrap_or_default()
+    }
+
+    pub fn memory_merge(&self, kind: AgentKind) -> Result<crate::memory_resolver::MergeConfig> {
+        let config = self
+            .agents
+            .get(&kind.to_string())
+            .and_then(|agent| agent.memory_merge.as_ref())
+            .or(self.memory_merge.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn backup_retention(&self, kind: AgentKind) -> Result<usize> {
@@ -232,6 +251,65 @@ fn validate_remote_root(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_backend_defaults_and_per_agent_overrides() {
+        use crate::memory_resolver::Backend;
+        assert!(
+            Config::default()
+                .memory_merge(AgentKind::Codex)
+                .unwrap()
+                .backend
+                == Backend::Builtin
+        );
+        let config: Config = toml::from_str(
+            r#"
+            [memory_merge]
+            backend = "opencode"
+            model = "provider/model"
+            [agents.codex.memory_merge]
+            backend = "anthropic"
+            model = "configured-model"
+            base_url = "https://gateway.invalid/v1"
+            api_key_env = "MERGE_KEY"
+        "#,
+        )
+        .unwrap();
+        assert!(config.memory_merge(AgentKind::Claude).unwrap().backend == Backend::Opencode);
+        let codex = config.memory_merge(AgentKind::Codex).unwrap();
+        assert!(codex.backend == Backend::Anthropic);
+        assert_eq!(codex.api_key_env.as_deref(), Some("MERGE_KEY"));
+        let invalid: Config = toml::from_str(
+            r#"
+            [memory_merge]
+            backend = "openai"
+            model = "test"
+            api_key = "private-test-key"
+            api_key_env = "MERGE_KEY"
+        "#,
+        )
+        .unwrap();
+        let error = invalid
+            .memory_merge(AgentKind::Codex)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("private-test-key"));
+        assert!(toml::from_str::<Config>("[memory_merge]\nbackend='unknown'").is_err());
+    }
+
+    #[test]
+    fn invalid_configuration_does_not_echo_inline_api_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[memory_merge]\nbackend='openai'\napi_key=private_test_credential\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&path)).err().unwrap();
+        assert!(!format!("{error:#}").contains("private_test_credential"));
+    }
+
     #[test]
     fn host_validation() {
         assert!(validate_host("user@mini-1").is_ok());

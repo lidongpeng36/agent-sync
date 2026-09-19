@@ -2,7 +2,9 @@ mod adapters;
 mod archive;
 mod config;
 mod core;
+mod memory_consistency;
 mod memory_merge;
+mod memory_resolver;
 mod remote;
 mod state;
 mod transport;
@@ -410,6 +412,7 @@ fn run() -> Result<i32> {
                     None => config.backup_retention(agent)?,
                 },
                 resources,
+                memory_merge: config.memory_merge(agent)?,
                 conflict_strategy: args
                     .conflict_strategy
                     .unwrap_or_else(|| config.conflict_strategy(agent)),

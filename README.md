@@ -23,7 +23,7 @@ Install the latest release from [crates.io](https://crates.io/crates/agent-sync)
 cargo install agent-sync --locked
 ```
 
-This requires Rust 1.85 or newer. Prebuilt binaries for macOS and Linux on
+This requires Rust 1.88 or newer. Prebuilt binaries for macOS and Linux on
 arm64 and x86_64 are also available from
 [GitHub Releases](https://github.com/lidongpeng36/agent-sync/releases/latest),
 with a SHA-256 checksum beside every archive.
@@ -38,8 +38,9 @@ cargo install --path . --locked
 
 `ssh` and `rsync` must be available locally. Claude and OpenCode writer
 detection also use `lsof` on both peers. Codex catalog repair uses
-`codex app-server`, and OpenCode synchronization uses the `opencode` CLI, on
-both peers.
+`codex app-server` on both peers for session apply; Codex memory-only sync and
+preview do not require Codex. OpenCode session synchronization uses the
+`opencode` CLI on both peers.
 
 ## Usage
 
@@ -220,6 +221,25 @@ of copying the database. Linear histories take the longer version; true
 divergences are retained under a deterministic fork ID so multi-machine syncs
 converge. Conflict strategy does not apply to OpenCode sessions.
 
+## Codex session comparison
+
+Codex rollouts are compared as complete JSON records, rather than serialized
+lines. Object key order and whitespace do not create conflicts. In
+`thread_settings_applied` events only, an absent `disabled_plugin_ids` and an
+empty array are equivalent. Nonempty values, unknown fields, timestamps,
+ordinals, tool results, and every other record remain part of comparison.
+Equivalent histories select the same original file in either host order;
+strict extensions select the complete longer history. True divergence still
+requires a choice. Staging and final verification continue to use exact bytes.
+Both local install and remote push use rsync checksums, including
+equal-size/equal-mtime changes.
+
+Legacy-to-paginated history conversion is not a formatting-only change. Complete
+that conversion with Codex's own migration tooling before comparing mixed
+formats; agent-sync does not discard legacy events to manufacture equivalence.
+Catalog repair uses root-scoped official `thread/read` calls after backup and
+journal publication, before final verification. It does not resume threads.
+
 ## Codex memory content merges
 
 Codex UTF-8 `.md` memory files use a shared, verified content baseline. This
@@ -232,9 +252,12 @@ merges. These are textual merges; review the diff when instruction semantics
 matter.
 
 The first successful apply establishes the baseline. Without matching valid
-baselines on both endpoints, differing files still require a choice. The old
-longer-block selection and nested local/remote summary concatenation are no
-longer used. Non-text and non-Markdown differences remain explicit conflicts.
+baselines, the builtin resolver can combine independently named Markdown
+sections when their preambles and any shared sections agree. Differing shared
+sections still require a choice or a configured semantic backend. Duplicate
+headings and malformed fences are not guessed through. The old longer-block
+selection and nested local/remote summary concatenation are not used. Non-text
+and non-Markdown differences remain explicit conflicts.
 Whole-file deletion is not propagated; synchronization remains additive.
 
 Baselines contain private copies of eligible memory text, stored atomically
@@ -252,7 +275,149 @@ used for preview while holding both endpoint locks. An interrupted baseline
 publication leaves mismatching copies unusable; it does not bypass transaction
 recovery. Baseline content travels through the typed helper protocol, separately
 from rsync; preview reports its UTF-8 content size separately from rsync wire
-statistics. The helper protocol is now version 5.
+statistics. The helper protocol is now version 7.
+
+## Optional memory merge backends
+
+No configuration or agent installation is needed for the default `builtin`
+resolver. It uses the deterministic rules above; it cannot prove arbitrary
+natural-language statements compatible. Configure an optional backend for
+semantic deduplication, complementary facts, and contradictory instructions.
+The backend runs on the coordinating machine, never on the SSH peer.
+
+Set one global `[memory_merge]` table, or override the entire table under
+`[agents.codex.memory_merge]` / `[agents.claude.memory_merge]`. The agent being
+synchronized and the merge backend are independent: Codex memory can be merged
+using OpenCode or an API without installing Codex. OpenCode itself has no
+separate memory resource.
+
+```toml
+# Default; this table can be omitted.
+[memory_merge]
+backend = "builtin"
+```
+
+Agent examples (choose one):
+
+```toml
+[memory_merge]
+backend = "codex"
+# command = "/absolute/path/to/codex"  # default: codex from PATH
+# model = "your-model"                 # optional
+# timeout_seconds = 600
+```
+
+```toml
+[memory_merge]
+backend = "opencode"
+model = "provider/model"
+# command = "/absolute/path/to/opencode"
+```
+
+API examples (choose one):
+
+```toml
+[memory_merge]
+backend = "openai"
+base_url = "https://gateway.example/v1"
+model = "your-model"
+api_key_env = "MEMORY_MERGE_API_KEY"
+# api_key = "..."  # alternative to api_key_env, never use both
+max_output_tokens = 32768
+# timeout_seconds = 600
+```
+
+```toml
+[memory_merge]
+backend = "anthropic"
+base_url = "https://gateway.example/v1"
+model = "your-model"
+api_key_env = "MEMORY_MERGE_API_KEY"
+```
+
+OpenAI uses Chat Completions (`/chat/completions`, Bearer authentication,
+`max_completion_tokens`); Anthropic uses Messages (`/messages`, `x-api-key`,
+`anthropic-version: 2023-06-01`, `max_tokens`). `base_url` is an API prefix,
+not a complete endpoint. A bare host gets `/v1`; custom prefixes are preserved.
+Without `base_url`, the respective official `/v1` endpoint is used. Without a
+key setting, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is read at request time.
+HTTP(S) endpoints are supported; URL credentials, query strings and redirects
+are rejected. Configuration and credentials are never included in SSH payloads.
+Direct keys belong in a private local config file; environment references keep
+them out of the file and command line.
+
+Codex requires `exec --ephemeral` and structured output support. It reuses its
+local authentication but ignores user config/rules and automatic memory/skill
+discovery, disables shell/apps/plugins/web search,
+and runs read-only in a private temporary directory. Set `model` explicitly to
+override its default. OpenCode requires `run --pure --format json`; it retains
+provider configuration, denies tool permissions, disables sharing and uses
+private temporary data/state/cache directories. On Unix it references the
+existing local `auth.json` through a temporary symlink, without copying it or the
+OpenCode database. Standard provider environment credentials also work. Temporary
+merge inputs, outputs and generated agent sessions are discarded after planning.
+
+With `ask`, configured backends merge differing UTF-8 Codex Markdown files;
+Claude uses them for unresolved memory content/index bundles and validates
+frontmatter and the index link together. Explicit `local`/`remote` policies do
+not invoke a backend. Equal files and one-sided file additions need no file-merge model
+call; a first cross-file review can still run when their contents have never been reviewed. Verified one-sided edits against a shared baseline also bypass the model.
+Large first-sync `MEMORY.md` task groups are partitioned by explicit source thread
+IDs, and `raw_memories.md` by its thread headers. Independent groups are retained
+without model rewriting; only overlapping groups are submitted. Unrecognized
+layouts fall back to whole-file review. A configured backend is also used during preview, so it can consume model
+usage and sends the differing memory text (plus a shared baseline, when present)
+to that backend. Session JSONL and credentials are not part of the merge prompt.
+
+Proposals must be JSON, match the input fingerprint, contain no conflict markers,
+and retain source references and thread IDs. Responses are bounded; API
+truncation/tool calls, agent timeouts, malformed proposals and backend-reported
+contradictions retain blockers. They never silently fall back to selecting a
+side. Semantic claims remain model judgments: the mechanical checks do not prove
+that every paraphrase preserves meaning or every quoted observation is authentic. Inspect `--format diff` as needed; the
+existing apply confirmation, writer protection, backups, stale-plan rejection,
+and full byte-level verification still apply. Successful sync establishes the
+normal baseline; a converged preview makes no model calls.
+
+### Cross-file consistency review
+
+After file merges, configured semantic backends review related Codex task groups,
+raw thread memories and rollout-summary files, plus `memory_summary.md` when
+present. Groups are linked by explicit source thread IDs. The builtin backend
+continues to use deterministic merges and does not infer factual corrections.
+
+The coordinator captures allowlisted original Markdown from both endpoints,
+checks it against the inventories, and supplies immutable evidence separately
+from writable staged candidates. A newly generated summary cannot certify
+itself. Review requests include source-file hashes and a complete input
+fingerprint. Corrections must be exact, unique replacements of at most 4096 UTF-8
+bytes, retain source IDs/links and structure, and quote at least 12 characters
+verbatim from a different original raw-memory or rollout-summary document.
+Unknown units, edited evidence, circular support, overlapping replacements and
+mixed corrections/conflicts are rejected. Unresolved facts block apply; no
+correction from an incomplete review is written to the stage. Explicit interactive
+file choices are protected from subsequent automatic rewriting.
+
+For example, an observed `git lfs prune --dry-run` output proves that the preview
+ran; it does not prove that real pruning ran or that space was reclaimed. The
+review can correct a contradictory catalog statement without running any cleanup
+command. It prioritizes explicit recorded observations and temporal context,
+not document age, length, type or majority vote alone. The program validates the
+quoted evidence and scope mechanically; semantic support remains a model judgment.
+
+A checksummed review-policy marker is published inside the **paired verified
+memory baseline**, only after the full transaction succeeds. Old baselines remain
+valid for three-way merges but do not count as reviewed. Missing/mismatched review
+state or changed candidate/evidence files requires review again. Active source
+groups are deferred, and previously deferred groups must be reviewed when they
+become inactive. Unchanged reviewed data reuses that durable approval without a
+model call. Preview alone does not publish approval; repeated previews before
+apply can invoke the backend again. Scan checkpoints never authorize skipping
+review. The helper protocol is version 7 for the review-baseline extension.
+
+Protocol references: [OpenCode CLI](https://opencode.ai/docs/cli/),
+[OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create).
 
 ## Safety model
 

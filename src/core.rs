@@ -99,7 +99,7 @@ fn localized_conflict_markers(local: &str, remote: &str, remote_label: &str) -> 
     result
 }
 
-fn has_conflict_markers(content: &str) -> bool {
+pub(crate) fn has_conflict_markers(content: &str) -> bool {
     content.lines().any(|line| {
         line.starts_with("<<<<<<< ") || line == "=======" || line.starts_with(">>>>>>> ")
     })
@@ -228,6 +228,7 @@ impl ResourceSelection {
 }
 
 pub struct SyncOptions {
+    pub memory_merge: crate::memory_resolver::MergeConfig,
     pub apply: bool,
     pub stability_seconds: f64,
     pub cache_dir: Option<PathBuf>,
@@ -568,7 +569,9 @@ fn resolution_symbol(resolution: &str) -> &'static str {
 }
 
 fn blocker_explanation(blocker: &Blocker) -> &str {
-    if blocker
+    if blocker.resource == "sessions" && blocker.reason.contains("requires a choice") {
+        "Session histories differ beyond recognized formatting and strict append changes."
+    } else if blocker
         .reason
         .starts_with("Codex memory requires a choice:")
     {
@@ -1155,6 +1158,10 @@ pub fn copy_file_atomic(source: &Path, destination: &Path) -> Result<()> {
         std::process::id()
     ));
     fs::copy(source, &temp)?;
+    filetime::set_file_mtime(
+        &temp,
+        filetime::FileTime::from_last_modification_time(&fs::metadata(source)?),
+    )?;
     fs::rename(&temp, destination)?;
     Ok(())
 }
@@ -1493,6 +1500,8 @@ mod tests {
         let local_payload = temp.path().join("local-payload");
         private_dir(&result).unwrap();
         fs::write(result.join("local.jsonl"), "local\n").unwrap();
+        let modified = filetime::FileTime::from_unix_time(1_700_000_000, 123_000_000);
+        filetime::set_file_mtime(result.join("local.jsonl"), modified).unwrap();
         fs::write(result.join("remote.jsonl"), "remote\n").unwrap();
         let files = vec![
             FileChange {
@@ -1523,6 +1532,12 @@ mod tests {
             1
         );
         assert!(local_payload.join("local.jsonl").is_file());
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(
+                &fs::metadata(local_payload.join("local.jsonl")).unwrap()
+            ),
+            modified
+        );
         assert!(!local_payload.join("remote.jsonl").exists());
     }
 }

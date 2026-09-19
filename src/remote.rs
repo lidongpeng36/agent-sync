@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -125,6 +125,11 @@ pub enum Request {
         stamp: String,
         times: Option<BTreeMap<String, StateTimes>>,
     },
+    CodexRuntime,
+    CodexCatalog {
+        root: String,
+        ids: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,9 +223,6 @@ fn dispatch(request: Request) -> Result<Value> {
                 bail!("remote {agent} root does not exist: {}", root.display());
             }
             match agent.as_str() {
-                "codex" if Command::new("codex").arg("--version").output().is_err() => {
-                    bail!("remote codex command is missing")
-                }
                 "claude" if Command::new("lsof").arg("-v").output().is_err() => {
                     bail!("remote lsof command is missing")
                 }
@@ -309,12 +311,13 @@ fn dispatch(request: Request) -> Result<Value> {
                 crate::state::load_transaction(&crate::state::default_state_root()?, "codex")?
                     .context("memory baseline requires a verified transaction")?;
             // Independently read back all eligible files; do not accept coordinator text blindly.
-            let actual = crate::memory_merge::Baseline::capture_excluding(
+            let mut actual = crate::memory_merge::Baseline::capture_excluding(
                 baseline.scope.clone(),
                 baseline.transaction_id.clone(),
                 &root,
                 &baseline.excluded_ids,
             )?;
+            actual.set_review_policy(baseline.review_policy.clone())?;
             if actual != baseline {
                 bail!("remote memory baseline content differs from verified result");
             }
@@ -445,6 +448,22 @@ fn dispatch(request: Request) -> Result<Value> {
                     "path": backup_state(&root, &stamp)?.to_string_lossy()
                 }))
             }
+        }
+        Request::CodexRuntime => {
+            let output = Command::new("codex")
+                .arg("--version")
+                .output()
+                .context("remote Codex session apply requires codex for catalog repair")?;
+            if !output.status.success() {
+                bail!("remote codex runtime check failed");
+            }
+            Ok(serde_json::json!({"ready":true}))
+        }
+        Request::CodexCatalog { root, ids } => {
+            let root = expand_root(&root)?;
+            Ok(serde_json::json!(
+                crate::adapters::codex::reconcile_catalog(&root, &ids)?
+            ))
         }
     }
 }

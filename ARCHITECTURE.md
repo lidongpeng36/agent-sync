@@ -90,7 +90,8 @@ Codex Markdown memory uses a separate durable, paired content baseline in the
 OS local data directory. Each checksummed snapshot contains only allowlisted
 UTF-8 Markdown text and is scoped to sorted node/root endpoints and resource
 selection. Both copies must match before they can inform planning; missing or
-invalid snapshots cause an explicit conflict for differing content. Baseline
+invalid snapshots allow only independent-section bootstrap or configured
+semantic review; unresolved shared sections remain conflicts. Baseline
 identity and contents are revalidated under endpoint locks before apply.
 Conservative line-based diff3 combines disjoint edits using the existing
 `similar` diff engine; overlapping edits and ambiguous insertion order require
@@ -99,8 +100,8 @@ concatenation heuristics. Session merge behavior is unchanged.
 For unresolved Codex memory, the shared editor preserves equal lines once and
 marks each differing region separately, keeping unchanged Markdown headings and
 sections as context. This is presentation only: without a trusted baseline,
-one-sided text still requires a choice, and local/remote choices remain whole-file
-choices.
+ambiguous shared text still requires a choice unless a configured semantic backend
+resolves it, and local/remote choices remain whole-file choices.
 
 After full two-endpoint verification and durable `verified` journals, each
 endpoint independently checks baseline text against its installed memory and
@@ -111,3 +112,68 @@ trust. The typed protocol carries baseline reads and verified publication, never
 arbitrary file writes. Active-excluded paths are omitted and whole-file removal
 remains unsupported. Preview baseline RPC content sizes are reported separately
 from rsync transfer statistics.
+
+Codex session relationship checks hash canonical JSON records, normalizing only
+an absent versus empty disabled_plugin_ids in thread_settings_applied events.
+All other fields remain significant. Equivalent inputs choose a deterministic
+original byte stream; strict extensions retain the full extending stream.
+Legacy/paginated conversions remain the responsibility of official Codex
+migration tooling. Source inventories and final manifests remain byte-exact.
+
+Codex catalog repair is a typed, root-scoped helper operation (protocol 7).
+Explicit thread/read calls repair missing rows that list scans can omit. It runs
+after both endpoint backups and journal publication, while endpoint locks remain
+held, and before final manifest verification and the verified journal phase.
+
+Sparse payload copies preserve staged mtimes. Codex stages portable whole-second
+rollout mtimes and stable aggregate-file mtimes to converge with protocol 29
+rsync. Local installation and remote pushes always use checksums so equal sizes
+and mtimes cannot hide selected content changes.
+
+Memory resolution is configured globally or per adapter in memory_resolver.
+Builtin operation needs no agent or network: paired baseline diff3 first, or
+independent unchanged Markdown sections without a baseline. Optional Codex and
+OpenCode processes and OpenAI/Anthropic HTTP backends receive only bounded
+memory text and return fingerprint-bound JSON proposals. The coordinator owns
+staging and checks markers, references, response completeness and limits. Model
+judgments are not substituted for writer checks, source-generation revalidation,
+byte hashes, transaction phases or paired baseline publication. Backend errors
+remain explicit blockers. Claude validates content/index bundles through the
+same validator used for editor choices. Preview may contact an explicitly
+configured backend, but never applies its result to either source tree.
+
+Codex memory-only operations do not probe for the Codex executable. Session apply
+checks runtime availability on both endpoints before backup or mutation. API
+credentials stay on the coordinator and are never sent to the SSH helper, printed
+in diagnostics, or placed in process arguments. Agent subprocesses have bounded
+lifetimes and private temporary files; OpenCode sessions use isolated storage.
+
+Semantic bootstrap of recognized Codex aggregates is source-scoped: MEMORY.md
+Task Groups form connected components only through thread IDs in rollout-summary
+citations; raw_memories.md uses explicit Thread headers. Source-only entries are
+retained, shared entries are reviewed, and model output must preserve the section
+forms and source identities. Unknown structures fall back to bounded whole-file
+review. This avoids asking a model to regenerate unrelated memories. Trusted
+one-sided baseline edits use deterministic advancement without a model call.
+The merge is followed by a separate cross-file consistency review when a semantic
+backend is configured.
+
+Cross-file consistency (memory_consistency) groups staged units through declared
+source IDs and includes the overview as context. Original allowlisted Markdown
+is copied and hash-checked against each endpoint inventory before any backend
+runs. Those immutable snapshots supply evidence; model-generated staged text
+cannot act as evidence. Only known candidate units may be edited, using unique,
+bounded replacements and exact quotes from independent original raw/leaf units.
+All responses are validated before corrected files are materialized. Contradictions,
+invalid evidence, backend failures and corrections to explicitly chosen files
+remain blockers, never partial approvals. No session logs or arbitrary referenced
+paths are opened for review.
+
+The optional baseline review_policy field is part of its checksum. Its absence
+retains the version-1 digest, preserving old merge bases while requiring initial
+review. Matching reviewed bases can skip unchanged candidate/evidence groups;
+original source-file versions are included in request fingerprints and cache
+eligibility, and prior active exclusions force review when those sources become
+eligible. Both endpoint copies are independently read back before publication;
+only a verified journal permits saving the marker. Policy changes require a new
+review version. Protocol 7 ensures helper agreement on these semantics.

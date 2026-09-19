@@ -140,6 +140,7 @@ impl SshTransport {
         let mut command = Command::new(&self.rsync);
         self.configure_rsync(&mut command);
         let output = command
+            .arg("--checksum")
             .args(["-e", &self.ssh])
             .arg(format!("{}/", source.display()))
             .arg(format!(

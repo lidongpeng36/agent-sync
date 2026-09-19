@@ -162,6 +162,58 @@ fn validate_edited_memory(
     Ok(MemoryChoice::Edited { content, index })
 }
 
+fn resolve_memory_with_backend(
+    conflict: &MemoryConflict,
+    stage: &Path,
+    temp: &Path,
+    config: &crate::memory_resolver::MergeConfig,
+) -> Result<Option<MemoryChoice>> {
+    let relative = Path::new("projects")
+        .join(&conflict.project)
+        .join("memory")
+        .join(&conflict.target);
+    let content = if conflict.content_requires_choice {
+        let result = crate::memory_resolver::resolve(
+            config,
+            &relative,
+            None,
+            &conflict.local_content,
+            &conflict.remote_content,
+        )?;
+        let Some(text) = result.text else {
+            return Ok(None);
+        };
+        text
+    } else {
+        fs::read_to_string(stage.join(&relative))?
+    };
+    let index = if conflict.index_requires_choice {
+        let result = crate::memory_resolver::resolve(
+            config,
+            &relative.with_extension("index.md"),
+            None,
+            &conflict.local_index,
+            &conflict.remote_index,
+        )?;
+        let Some(text) = result.text else {
+            return Ok(None);
+        };
+        text
+    } else if !conflict.local_index.is_empty() {
+        conflict.local_index.clone()
+    } else {
+        conflict.remote_index.clone()
+    };
+    let path = temp.join("semantic-validation").join(&relative);
+    private_dir(path.parent().context("memory path has no parent")?)?;
+    fs::write(&path, &content)?;
+    Ok(Some(validate_edited_memory(
+        conflict,
+        &path,
+        vec![content.into_bytes(), index.into_bytes()],
+    )?))
+}
+
 impl Adapter for ClaudeAdapter {
     fn doctor(&self, local: &Path, remote: &str, transport: &SshTransport) -> Result<()> {
         if !local.exists() {
@@ -227,7 +279,7 @@ impl Adapter for ClaudeAdapter {
         drop(scan_guard);
         let stage = temp.path().join("stage");
         private_dir(&stage)?;
-        let (mut report, conflicts) = build_stage(
+        let (mut report, mut conflicts) = build_stage(
             local,
             &remote,
             &stage,
@@ -236,6 +288,53 @@ impl Adapter for ClaudeAdapter {
             &transport.host,
             options.conflict_strategy,
         )?;
+        let mut choices = BTreeMap::new();
+        if options.conflict_strategy == ConflictStrategy::Ask
+            && options.memory_merge.backend != crate::memory_resolver::Backend::Builtin
+            && !conflicts.is_empty()
+        {
+            let mut notes = Vec::new();
+            for conflict in &conflicts {
+                match resolve_memory_with_backend(
+                    conflict,
+                    &stage,
+                    temp.path(),
+                    &options.memory_merge,
+                ) {
+                    Ok(Some(choice)) => {
+                        choices.insert((conflict.project.clone(), conflict.target.clone()), choice);
+                        notes.push(format!(
+                            "memory {} merge: {}/{}",
+                            options.memory_merge.backend.name(),
+                            conflict.project,
+                            conflict.target
+                        ));
+                    }
+                    Ok(None) => notes.push(format!(
+                        "memory semantic conflict: {}/{}",
+                        conflict.project, conflict.target
+                    )),
+                    Err(error) => notes.push(format!(
+                        "memory {} backend failed: {error}",
+                        options.memory_merge.backend.name()
+                    )),
+                }
+            }
+            if !choices.is_empty() {
+                fs::remove_dir_all(&stage)?;
+                private_dir(&stage)?;
+                (report, conflicts) = build_stage(
+                    local,
+                    &remote,
+                    &stage,
+                    options.resources,
+                    &choices,
+                    &transport.host,
+                    options.conflict_strategy,
+                )?;
+            }
+            report.notes.extend(notes);
+        }
         let transferred_bytes = remote_inventory
             .entries
             .iter()
@@ -265,7 +364,7 @@ impl Adapter for ClaudeAdapter {
             local_fingerprint: local_inventory.generation,
             remote_fingerprint: remote_inventory.generation,
             conflicts,
-            choices: BTreeMap::new(),
+            choices,
             resources: options.resources,
             state_root,
             local_node_id,
@@ -683,10 +782,10 @@ fn validate_claude_jsonl(path: &Path, relative: &Path) -> Result<i64> {
             relative.display()
         );
     }
-    if let Some(expected) = agent {
-        if agent_ids != BTreeSet::from([expected]) {
-            bail!("agentId does not match Claude path: {}", relative.display());
-        }
+    if let Some(expected) = agent
+        && agent_ids != BTreeSet::from([expected])
+    {
+        bail!("agentId does not match Claude path: {}", relative.display());
     }
     times
         .into_iter()
@@ -1485,10 +1584,10 @@ fn parse_lsof_writers(output: &str) -> BTreeSet<String> {
     for line in output.lines() {
         if let Some(pid) = line.strip_prefix('p') {
             current = Some(pid.to_owned());
-        } else if re.is_match(line) {
-            if let Some(pid) = &current {
-                writers.insert(pid.clone());
-            }
+        } else if re.is_match(line)
+            && let Some(pid) = &current
+        {
+            writers.insert(pid.clone());
         }
     }
     writers
@@ -1496,13 +1595,13 @@ fn parse_lsof_writers(output: &str) -> BTreeSet<String> {
 
 fn verify_event_mtimes(root: &Path, side: &str) -> Result<()> {
     for (path, file) in session_files(root)? {
-        if let Some(event) = file.event_ns {
-            if file.mtime_ns != event {
-                bail!(
-                    "{side} event mtime verification failed for {}",
-                    path.display()
-                );
-            }
+        if let Some(event) = file.event_ns
+            && file.mtime_ns != event
+        {
+            bail!(
+                "{side} event mtime verification failed for {}",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -1639,6 +1738,51 @@ mod tests {
             format!("# Memory\n\n- [facts](facts.md) — {description}\n"),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_backend_validates_memory_and_index_as_a_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        let command = temp.path().join("resolver");
+        fs::write(&command, r#"#!/usr/bin/env python3
+import json,pathlib,sys
+prompt=sys.stdin.read()
+fingerprint=prompt.split('Input fingerprint: ')[1].split('\n')[0]
+data=json.loads(prompt.split('Input JSON:\n')[1])
+if data['path'].endswith('.index.md'):
+ text='- [facts](facts.md) - combined description\n'
+else:
+ text='---\nname: facts\ndescription: combined description\ntype: project\n---\ncombined body\n'
+pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(json.dumps({'input_sha256':fingerprint,'merged':text,'conflicts':[]}))
+"#).unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = crate::memory_resolver::MergeConfig {
+            backend: crate::memory_resolver::Backend::Codex,
+            command: Some(command),
+            ..Default::default()
+        };
+        let conflict = MemoryConflict {
+            project: "project".into(),
+            target: "facts.md".into(),
+            local_content: "local body".into(),
+            remote_content: "remote body".into(),
+            local_index: "- [facts](facts.md) - local description\n".into(),
+            remote_index: "- [facts](facts.md) - remote description\n".into(),
+            content_requires_choice: true,
+            index_requires_choice: true,
+        };
+        let choice = resolve_memory_with_backend(&conflict, &stage, temp.path(), &config)
+            .unwrap()
+            .unwrap();
+        let MemoryChoice::Edited { content, index } = choice else {
+            panic!("expected checked bundle");
+        };
+        assert!(content.contains("name: facts"));
+        assert_eq!(index.matches("](facts.md)").count(), 1);
+        assert!(!stage.exists());
     }
 
     #[test]

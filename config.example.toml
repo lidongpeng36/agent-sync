@@ -3,6 +3,15 @@ version = 1
 # Keep at least the newest verified backup set on each endpoint.
 backup_retention = 1
 
+# No model is called by default. See README for agent/API examples.
+[memory_merge]
+backend = "builtin"
+timeout_seconds = 600
+max_output_tokens = 32768
+# For Codex: backend = "codex"
+# For OpenCode: backend = "opencode", model = "provider/model"
+# API backends: "openai" or "anthropic"; set model, base_url and api_key_env.
+
 [peers.mini]
 host = "mini"
 ssh = "/usr/bin/ssh"
