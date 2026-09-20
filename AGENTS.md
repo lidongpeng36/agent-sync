@@ -46,8 +46,10 @@ Read `ARCHITECTURE.md` before changing cross-module behavior.
   validation and staged metadata updates.
 - A preview must remain useful when an active Codex session is excluded. Do not
   let its aggregate history, index, catalog, or timestamps change indirectly.
-- Claude and OpenCode database/file writers block apply. Never reinterpret a
-  conflict choice as permission to override writer safety.
+- Claude active session bundles and their project memory/shared indexes must be
+  excluded on both endpoints. Unknown writers or newly active in-scope data block
+  apply; archive imports retain a full-root writer gate. OpenCode writers block
+  apply. Never reinterpret a conflict choice as permission to override safety.
 
 ### Apply and recovery
 

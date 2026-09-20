@@ -1,4 +1,4 @@
-//! Durable, paired Codex Markdown merge bases. These are not scan hash caches.
+//! Durable, paired Codex/Claude Markdown merge bases. These are not scan hash caches.
 use crate::core::{ResourceSelection, bytes_sha256, private_dir, safe_relative};
 use crate::state::{TransactionJournal, TransactionPhase};
 use anyhow::{Context, Result, bail};
@@ -21,7 +21,7 @@ impl Endpoint {
             node,
             root: fs::canonicalize(root)?
                 .to_str()
-                .context("non-UTF-8 Codex root")?
+                .context("non-UTF-8 agent root")?
                 .to_owned(),
         })
     }
@@ -63,6 +63,10 @@ impl Scope {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Baseline {
+    #[serde(default = "codex_agent", skip_serializing_if = "is_codex")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub excluded_projects: BTreeSet<String>,
     version: u32,
     pub scope: Scope,
     pub transaction_id: String,
@@ -77,6 +81,24 @@ pub struct Baseline {
 pub struct View {
     pub scope: Scope,
     pub baseline: Option<Baseline>,
+}
+
+fn codex_agent() -> String {
+    "codex".into()
+}
+fn is_codex(agent: &str) -> bool {
+    agent == "codex"
+}
+
+pub fn eligible_for(agent: &str, path: &Path) -> bool {
+    match agent {
+        "codex" => eligible(path),
+        "claude" => {
+            crate::core::safe_relative(path).is_ok()
+                && !crate::adapters::claude::archive_excluded(path, ResourceSelection::Memory)
+        }
+        _ => false,
+    }
 }
 
 pub fn eligible(path: &Path) -> bool {
@@ -101,8 +123,31 @@ impl Baseline {
         root: &Path,
         excluded_ids: &BTreeSet<String>,
     ) -> Result<Self> {
+        Self::capture_agent(
+            "codex",
+            scope,
+            transaction_id,
+            root,
+            excluded_ids,
+            &BTreeSet::new(),
+        )
+    }
+
+    pub fn capture_agent(
+        agent: &str,
+        scope: Scope,
+        transaction_id: String,
+        root: &Path,
+        excluded_ids: &BTreeSet<String>,
+        excluded_projects: &BTreeSet<String>,
+    ) -> Result<Self> {
         let mut files = BTreeMap::new();
-        for entry in walkdir::WalkDir::new(root.join("memories")).follow_links(false) {
+        let directory = if agent == "codex" {
+            "memories"
+        } else {
+            "projects"
+        };
+        for entry in walkdir::WalkDir::new(root.join(directory)).follow_links(false) {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error)
@@ -116,7 +161,10 @@ impl Baseline {
             };
             let relative = entry.path().strip_prefix(root)?;
             if entry.file_type().is_file()
-                && eligible(relative)
+                && eligible_for(agent, relative)
+                && !relative.components().nth(1).is_some_and(|p| {
+                    excluded_projects.contains(p.as_os_str().to_string_lossy().as_ref())
+                })
                 && !excluded_ids
                     .iter()
                     .any(|id| relative.to_string_lossy().contains(id))
@@ -136,6 +184,8 @@ impl Baseline {
             }
         }
         let mut value = Self {
+            agent: agent.to_owned(),
+            excluded_projects: excluded_projects.clone(),
             version: 1,
             scope,
             transaction_id,
@@ -156,6 +206,18 @@ impl Baseline {
     }
 
     fn digest(&self) -> Result<String> {
+        if self.agent != "codex" || !self.excluded_projects.is_empty() {
+            return Ok(bytes_sha256(&serde_json::to_vec(&(
+                self.version,
+                &self.agent,
+                &self.scope,
+                &self.transaction_id,
+                &self.files,
+                &self.excluded_ids,
+                &self.excluded_projects,
+                &self.review_policy,
+            ))?));
+        }
         // Preserve the original digest for old, unreviewed baselines.
         if let Some(policy) = &self.review_policy {
             return Ok(bytes_sha256(&serde_json::to_vec(&(
@@ -178,6 +240,23 @@ impl Baseline {
 
     pub fn validate(&self) -> Result<()> {
         self.scope.validate()?;
+        if !matches!(self.agent.as_str(), "codex" | "claude") {
+            bail!("unknown memory baseline agent");
+        }
+        for project in &self.excluded_projects {
+            safe_relative(Path::new(project))?;
+            if Path::new(project).components().count() != 1 {
+                bail!("invalid baseline project exclusion");
+            }
+        }
+        if self.files.keys().any(|p| {
+            Path::new(p).components().nth(1).is_some_and(|p| {
+                self.excluded_projects
+                    .contains(p.as_os_str().to_string_lossy().as_ref())
+            })
+        }) {
+            bail!("baseline contains excluded project");
+        }
         if self
             .excluded_ids
             .iter()
@@ -186,14 +265,20 @@ impl Baseline {
                 .files
                 .keys()
                 .any(|p| self.excluded_ids.iter().any(|id| p.contains(id)))
-            || self
-                .review_policy
-                .as_ref()
-                .is_some_and(|p| p != crate::memory_consistency::POLICY)
+            || self.review_policy.as_ref().is_some_and(|p| {
+                p != if self.agent == "claude" {
+                    crate::memory_consistency::CLAUDE_POLICY
+                } else {
+                    crate::memory_consistency::POLICY
+                }
+            })
             || self.version != 1
             || self.transaction_id.len() != 64
             || !self.transaction_id.bytes().all(|b| b.is_ascii_hexdigit())
-            || self.files.keys().any(|p| !eligible(Path::new(p)))
+            || self
+                .files
+                .keys()
+                .any(|p| !eligible_for(&self.agent, Path::new(p)))
             || self.checksum != self.digest()?
         {
             bail!("invalid memory baseline identity, paths or checksum");
@@ -206,6 +291,14 @@ pub fn storage_root() -> Result<PathBuf> {
     dirs::data_local_dir()
         .map(|p| p.join("agent-sync/memory-baselines"))
         .context("cannot determine durable memory baseline directory")
+}
+
+pub fn storage_root_for(agent: &str) -> Result<PathBuf> {
+    match agent {
+        "codex" => storage_root(),
+        "claude" => Ok(storage_root()?.join("claude")),
+        _ => bail!("unsupported memory baseline agent"),
+    }
 }
 
 fn path(root: &Path, scope: &Scope) -> Result<PathBuf> {
@@ -249,13 +342,13 @@ pub fn save_verified(root: &Path, value: &Baseline, journal: &TransactionJournal
     nodes.sort();
     let mut scope_nodes = value.scope.endpoints.each_ref().map(|e| e.node.as_str());
     scope_nodes.sort();
-    if journal.agent != "codex"
+    if journal.agent != value.agent
         || journal.phase != TransactionPhase::Verified
         || journal.transaction_id != value.transaction_id
         || journal.resources != value.scope.resources
         || nodes != scope_nodes
     {
-        bail!("memory baseline requires its verified Codex transaction");
+        bail!("memory baseline requires its matching verified agent transaction");
     }
     private_dir(root)?;
     let mut tmp = tempfile::NamedTempFile::new_in(root)?;
@@ -315,6 +408,50 @@ pub fn merge(base: &str, local: &str, remote: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_baselines_are_agent_scoped_and_omit_deferred_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        for project in ["active", "idle"] {
+            fs::create_dir_all(temp.path().join(format!("projects/{project}/memory"))).unwrap();
+            fs::write(
+                temp.path()
+                    .join(format!("projects/{project}/memory/note.md")),
+                "memory\n",
+            )
+            .unwrap();
+        }
+        let mut journal = journal();
+        journal.agent = "claude".into();
+        let base = Baseline::capture_agent(
+            "claude",
+            scope(),
+            journal.transaction_id.clone(),
+            temp.path(),
+            &BTreeSet::new(),
+            &BTreeSet::from(["active".into()]),
+        )
+        .unwrap();
+        assert_eq!(base.files.len(), 1);
+        assert!(base.files.contains_key("projects/idle/memory/note.md"));
+        let store = temp.path().join("bases");
+        save_verified(&store, &base, &journal).unwrap();
+        assert_eq!(load(&store, &scope()).unwrap(), Some(base.clone()));
+        journal.agent = "codex".into();
+        assert!(save_verified(&store, &base, &journal).is_err());
+        let codex = Baseline::capture(scope(), base.transaction_id.clone(), temp.path()).unwrap();
+        assert!(common(Some(&base), Some(&codex)).is_none());
+        let old = serde_json::to_value(&codex).unwrap();
+        assert!(old.get("agent").is_none() && old.get("excluded_projects").is_none());
+        let mut tampered = serde_json::to_value(&base).unwrap();
+        tampered["agent"] = serde_json::json!("codex");
+        assert!(
+            serde_json::from_value::<Baseline>(tampered)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
 
     #[test]
     fn review_policy_is_paired_checksummed_and_old_baselines_remain_valid() {

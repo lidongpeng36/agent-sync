@@ -1,3 +1,4 @@
+use super::claude_activity::{self, Activity};
 use super::{Adapter, Prepared};
 use crate::core::{
     Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PayloadSide, PlanReport,
@@ -6,6 +7,7 @@ use crate::core::{
     inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
     safe_relative, seed_remote_deltas, sha256, stamp,
 };
+use crate::memory_merge::{self, Baseline, Endpoint, Scope};
 use crate::remote::{BackupKind, MtimeUpdate, Request as RemoteRequest, create_backup};
 use crate::transport::SshTransport;
 use anyhow::{Context, Result, bail};
@@ -56,6 +58,89 @@ pub struct ClaudePrepared {
     state_root: PathBuf,
     local_node_id: String,
     remote_node_id: String,
+    activity: Activity,
+    memory_basis: Option<Box<MemoryBasis>>,
+    merge_config: crate::memory_resolver::MergeConfig,
+    memory_reviewed: bool,
+}
+
+struct MemoryBasis {
+    scope: Scope,
+    local: Option<Baseline>,
+    remote: Option<Baseline>,
+}
+
+fn memory_basis(
+    local: &Path,
+    remote: &str,
+    t: &SshTransport,
+    local_node: &str,
+    remote_node: &str,
+    resources: ResourceSelection,
+) -> Result<MemoryBasis> {
+    let peer = Endpoint::new(local_node.to_owned(), local)?;
+    let view: memory_merge::View = t.remote_request(&RemoteRequest::MemoryBaseline {
+        agent: "claude".into(),
+        root: remote.into(),
+        peer: peer.clone(),
+        resources,
+    })?;
+    if !view.scope.endpoints.contains(&peer)
+        || view.scope.resources != resources
+        || !view
+            .scope
+            .endpoints
+            .iter()
+            .any(|e| e.node == remote_node && *e != peer)
+    {
+        bail!("Claude memory baseline scope mismatch");
+    }
+    let local = memory_merge::load(&memory_merge::storage_root_for("claude")?, &view.scope)?
+        .filter(|b| b.agent == "claude");
+    Ok(MemoryBasis {
+        scope: view.scope,
+        local,
+        remote: view.baseline,
+    })
+}
+
+fn activity_pair(local: &Path, remote: &str, t: &SshTransport) -> Result<Activity> {
+    let mut a = claude_activity::detect(local)?;
+    let other: Activity = t.remote_request(&RemoteRequest::ClaudeActivity {
+        root: remote.into(),
+        session_ids: a.sessions.iter().cloned().collect(),
+    })?;
+    other.validate()?;
+    a.merge(other);
+    claude_activity::map_projects(local, &mut a)?;
+    Ok(a)
+}
+
+fn ensure_activity(
+    local: &Path,
+    remote: &str,
+    t: &SshTransport,
+    expected: &Activity,
+) -> Result<()> {
+    if !expected.covers(&activity_pair(local, remote, t)?) {
+        bail!(
+            "Claude activity changed after preview; rerun sync to exclude newly active sessions/projects"
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_selected(root: &Path, target: &Path, inventory: &crate::core::Inventory) -> Result<()> {
+    private_dir(target)?;
+    for entry in &inventory.entries {
+        let path = Path::new(&entry.path);
+        safe_relative(path)?;
+        copy_file_atomic(&root.join(path), &target.join(path))?;
+        if sha256(&target.join(path))? != entry.sha256 {
+            bail!("Claude source changed during snapshot; rerun sync");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> {
@@ -75,7 +160,7 @@ pub(super) fn print_diff(prepared: &ClaudePrepared, local: &Path) -> Result<()> 
         );
     }
     print_planned_diff(local, &prepared.remote_view, &prepared.stage, |path| {
-        excluded(path, prepared.resources)
+        excluded(path, prepared.resources) || prepared.activity.excludes(path)
     })
 }
 
@@ -91,6 +176,22 @@ fn edit_memory_conflict(
     stage: &Path,
     peer: &str,
 ) -> Result<MemoryChoice> {
+    if conflict.target == "MEMORY.md" {
+        let mut edited = edit_conflict_documents(
+            &root.join(&conflict.project),
+            &[EditDocument {
+                name: "MEMORY-preamble.md",
+                local: conflict.local_content.as_bytes(),
+                remote: conflict.remote_content.as_bytes(),
+                remote_label: peer,
+                localized_conflicts: true,
+            }],
+        )?;
+        return Ok(MemoryChoice::Edited {
+            content: String::from_utf8(edited.remove(0))?,
+            index: String::new(),
+        });
+    }
     let directory = root.join(&conflict.project).join(&conflict.target);
     private_dir(&directory)?;
     let content_path = directory.join(&conflict.target);
@@ -129,14 +230,14 @@ fn edit_memory_conflict(
                 local: &local_content,
                 remote: &remote_content,
                 remote_label: &remote_label,
-                localized_conflicts: false,
+                localized_conflicts: true,
             },
             EditDocument {
                 name: "MEMORY-entry.md",
                 local: &local_index,
                 remote: &remote_index,
                 remote_label: &remote_label,
-                localized_conflicts: false,
+                localized_conflicts: true,
             },
         ],
     )?;
@@ -150,6 +251,12 @@ fn validate_edited_memory(
 ) -> Result<MemoryChoice> {
     let index = String::from_utf8(edited.pop().context("edited memory index missing")?)?;
     let content = String::from_utf8(edited.pop().context("edited memory content missing")?)?;
+    if conflict.target == "MEMORY.md" {
+        return Ok(MemoryChoice::Edited {
+            content,
+            index: String::new(),
+        });
+    }
     if content.trim().is_empty() {
         bail!("edited memory content is empty");
     }
@@ -162,21 +269,48 @@ fn validate_edited_memory(
     Ok(MemoryChoice::Edited { content, index })
 }
 
+fn baseline_index(baseline: Option<&Baseline>, project: &str) -> Result<Option<MemoryIndex>> {
+    let prefix = format!("projects/{project}/memory/");
+    let files = baseline
+        .map(|b| {
+            b.files
+                .keys()
+                .filter_map(|p| p.strip_prefix(&prefix))
+                .filter(|p| *p != "MEMORY.md")
+                .map(|p| (p.to_owned(), PathBuf::new()))
+                .collect()
+        })
+        .unwrap_or_default();
+    baseline
+        .and_then(|b| b.files.get(&format!("{prefix}MEMORY.md")))
+        .map(|text| parse_memory_index(text, &files, false))
+        .transpose()
+}
+
 fn resolve_memory_with_backend(
     conflict: &MemoryConflict,
     stage: &Path,
     temp: &Path,
     config: &crate::memory_resolver::MergeConfig,
+    baseline: Option<&Baseline>,
 ) -> Result<Option<MemoryChoice>> {
     let relative = Path::new("projects")
         .join(&conflict.project)
         .join("memory")
         .join(&conflict.target);
+    let bi = baseline_index(baseline, &conflict.project)?;
+    let base_content = if conflict.target == "MEMORY.md" {
+        bi.as_ref().map(|i| i.preamble.as_str())
+    } else {
+        baseline
+            .and_then(|b| b.files.get(&relative.to_string_lossy().into_owned()))
+            .map(String::as_str)
+    };
     let content = if conflict.content_requires_choice {
         let result = crate::memory_resolver::resolve(
             config,
             &relative,
-            None,
+            base_content,
             &conflict.local_content,
             &conflict.remote_content,
         )?;
@@ -191,7 +325,9 @@ fn resolve_memory_with_backend(
         let result = crate::memory_resolver::resolve(
             config,
             &relative.with_extension("index.md"),
-            None,
+            bi.as_ref()
+                .and_then(|i| i.items.get(&conflict.target))
+                .map(String::as_str),
             &conflict.local_index,
             &conflict.remote_index,
         )?;
@@ -214,12 +350,84 @@ fn resolve_memory_with_backend(
     )?))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn review_memory(
+    stage: &Path,
+    local: &Path,
+    remote: &Path,
+    config: &crate::memory_resolver::MergeConfig,
+    baseline: Option<&Baseline>,
+    protected: &BTreeSet<String>,
+    report: &mut PlanReport,
+) -> Result<bool> {
+    if report.conflict_strategy != Some(ConflictStrategy::Ask)
+        || !report.resources.iter().any(|r| r == "memory")
+        || !report.blockers.is_empty()
+        || config.backend == crate::memory_resolver::Backend::Builtin
+    {
+        return Ok(false);
+    }
+    let mut frontmatter = Vec::new();
+    for project in project_names(stage)? {
+        for (name, path) in memory_files(&stage.join("projects").join(project).join("memory"))? {
+            if synthesize_block(&path, &name).is_ok() {
+                frontmatter.push((name, path));
+            }
+        }
+    }
+    let review = crate::memory_consistency::review_with_protected(
+        stage,
+        config,
+        baseline,
+        &BTreeSet::new(),
+        protected,
+        &[local, remote],
+    );
+    match review {
+        Ok(review) => {
+            report.notes.extend(review.notes);
+            if let Some(reason) = review.blocker {
+                report.blockers.push(Blocker {
+                    resource: "memory-consistency".into(),
+                    path: "projects/*/memory".into(),
+                    reason,
+                });
+                return Ok(false);
+            }
+            validate_archive_snapshot(stage, ResourceSelection::Memory)?;
+            for (name, path) in &frontmatter {
+                synthesize_block(path, name)
+                    .context("memory review removed required Claude frontmatter")?;
+            }
+            report.files = planned_file_changes(local, remote, stage, |p| {
+                excluded(
+                    p,
+                    if report.resources.len() == 2 {
+                        ResourceSelection::All
+                    } else {
+                        ResourceSelection::Memory
+                    },
+                )
+            })?;
+            Ok(review.checked)
+        }
+        Err(error) => {
+            report.blockers.push(Blocker {
+                resource: "memory-consistency".into(),
+                path: "projects/*/memory".into(),
+                reason: format!("Claude memory review failed: {error}"),
+            });
+            Ok(false)
+        }
+    }
+}
+
 impl Adapter for ClaudeAdapter {
     fn doctor(&self, local: &Path, remote: &str, transport: &SshTransport) -> Result<()> {
         if !local.exists() {
             bail!("Claude root does not exist: {}", local.display());
         }
-        for command in [&transport.ssh, &transport.rsync, "/usr/sbin/lsof"] {
+        for command in [&transport.ssh, &transport.rsync, "lsof"] {
             if !SshTransport::command_exists(command) {
                 bail!("required local command not found: {command}");
             }
@@ -247,10 +455,26 @@ impl Adapter for ClaudeAdapter {
         })?;
         let remote = temp.path().join("remote-view");
         private_dir(&remote)?;
-        let exclude = |path: &Path| excluded(path, options.resources);
+        let activity = activity_pair(local, remote_root, transport)?;
+        let exclude = |path: &Path| excluded(path, options.resources) || activity.excludes(path);
         let state_root = crate::state::state_root(options)?;
         let local_node_id = crate::state::node_id(&state_root)?;
         let remote_node_id = transport.remote_node_id()?;
+        let memory_basis = if options.resources.memory() {
+            Some(Box::new(memory_basis(
+                local,
+                remote_root,
+                transport,
+                &local_node_id,
+                &remote_node_id,
+                options.resources,
+            )?))
+        } else {
+            None
+        };
+        let base = memory_basis
+            .as_ref()
+            .and_then(|b| memory_merge::common(b.local.as_ref(), b.remote.as_ref()));
         let previous =
             crate::state::load(&state_root, "claude", &transport.host, options.resources)?;
         let (local_inventory, reused) = inventory_cached(
@@ -263,7 +487,8 @@ impl Adapter for ClaudeAdapter {
                 root: remote_root.to_owned(),
                 agent: "claude".to_owned(),
                 resources: options.resources,
-                excluded_ids: Vec::new(),
+                excluded_ids: activity.sessions.iter().cloned().collect(),
+                excluded_projects: activity.projects.iter().cloned().collect(),
                 peer_id: local_node_id.clone(),
             })?;
         let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
@@ -276,17 +501,26 @@ impl Adapter for ClaudeAdapter {
         )?;
         let transfer_stats = transport.pull_files(remote_root, &remote, &transfer)?;
         complete_remote_view(local, &local_inventory, &remote, &remote_inventory)?;
+        let local_view = temp.path().join("local-copy");
+        snapshot_selected(local, &local_view, &local_inventory)?;
+        // Content-addressed remote views may share hard links with local sources.
+        // Detach them before they become editor/model evidence.
+        let immutable_remote = temp.path().join("remote-copy");
+        snapshot_selected(&remote, &immutable_remote, &remote_inventory)?;
+        let remote = immutable_remote;
+        ensure_activity(local, remote_root, transport, &activity)?;
         drop(scan_guard);
         let stage = temp.path().join("stage");
         private_dir(&stage)?;
-        let (mut report, mut conflicts) = build_stage(
-            local,
+        let (mut report, mut conflicts) = build_stage_with_base(
+            &local_view,
             &remote,
             &stage,
             options.resources,
             &BTreeMap::new(),
             &transport.host,
             options.conflict_strategy,
+            base.as_ref(),
         )?;
         let mut choices = BTreeMap::new();
         if options.conflict_strategy == ConflictStrategy::Ask
@@ -300,6 +534,7 @@ impl Adapter for ClaudeAdapter {
                     &stage,
                     temp.path(),
                     &options.memory_merge,
+                    base.as_ref(),
                 ) {
                     Ok(Some(choice)) => {
                         choices.insert((conflict.project.clone(), conflict.target.clone()), choice);
@@ -323,17 +558,50 @@ impl Adapter for ClaudeAdapter {
             if !choices.is_empty() {
                 fs::remove_dir_all(&stage)?;
                 private_dir(&stage)?;
-                (report, conflicts) = build_stage(
-                    local,
+                (report, conflicts) = build_stage_with_base(
+                    &local_view,
                     &remote,
                     &stage,
                     options.resources,
                     &choices,
                     &transport.host,
                     options.conflict_strategy,
+                    base.as_ref(),
                 )?;
             }
             report.notes.extend(notes);
+        }
+        let memory_reviewed = review_memory(
+            &stage,
+            &local_view,
+            &remote,
+            &options.memory_merge,
+            base.as_ref(),
+            &BTreeSet::new(),
+            &mut report,
+        )?;
+        if !activity.sessions.is_empty() || !activity.projects.is_empty() {
+            report.notes.push(format!(
+                "Claude active sessions skipped: {}; project memory/shared indexes deferred: {}",
+                activity.sessions.len(),
+                activity.projects.len()
+            ));
+            for id in &activity.sessions {
+                report
+                    .notes
+                    .push(format!("excluded active Claude session: {id}"));
+            }
+        }
+        if options.resources.memory() && base.is_none() {
+            report.notes.push("Claude memory: no matching verified baseline; only unambiguous independent sections merge automatically".into());
+        }
+        if let Some(basis) = &memory_basis {
+            let bytes = basis
+                .remote
+                .as_ref()
+                .map(|b| b.files.values().map(String::len).sum::<usize>())
+                .unwrap_or(0);
+            report.notes.push(format!("Claude memory baseline: remote UTF-8 content={bytes} bytes via typed RPC (separate from rsync statistics)"));
         }
         let transferred_bytes = remote_inventory
             .entries
@@ -369,6 +637,10 @@ impl Adapter for ClaudeAdapter {
             state_root,
             local_node_id,
             remote_node_id,
+            activity,
+            memory_basis,
+            merge_config: options.memory_merge.clone(),
+            memory_reviewed,
         }))
     }
 
@@ -382,7 +654,13 @@ impl Adapter for ClaudeAdapter {
         if !tty {
             return Ok(());
         }
+        let mut protected = BTreeSet::new();
         for conflict in value.conflicts.clone() {
+            protected.insert(format!(
+                "projects/{}/memory/{}",
+                conflict.project, conflict.target
+            ));
+            protected.insert(format!("projects/{}/memory/MEMORY.md", conflict.project));
             let choice = choose_interactively(
                 &format!(
                     "Claude memory conflict [{}/{}]",
@@ -410,13 +688,28 @@ impl Adapter for ClaudeAdapter {
         }
         fs::remove_dir_all(&value.stage)?;
         private_dir(&value.stage)?;
-        let (report, _) = build_stage_from_choices(
+        let base = value
+            .memory_basis
+            .as_ref()
+            .and_then(|b| memory_merge::common(b.local.as_ref(), b.remote.as_ref()));
+        let (mut report, _) = build_stage_with_base(
+            &value.temp.path().join("local-copy"),
             &value.remote_view,
             &value.stage,
             value.resources,
             &value.choices,
             &value.report.peer,
             ConflictStrategy::Ask,
+            base.as_ref(),
+        )?;
+        value.memory_reviewed = review_memory(
+            &value.stage,
+            &value.temp.path().join("local-copy"),
+            &value.remote_view,
+            &value.merge_config,
+            base.as_ref(),
+            &protected,
+            &mut report,
         )?;
         value.report = report;
         value.conflicts.clear();
@@ -434,7 +727,7 @@ impl Adapter for ClaudeAdapter {
         let Prepared::Claude(value) = prepared else {
             bail!("adapter/prepared plan mismatch");
         };
-        let exclude = |p: &Path| excluded(p, value.resources);
+        let exclude = |p: &Path| excluded(p, value.resources) || value.activity.excludes(p);
         let _sync_guards = transport.sync_guards(
             &value.state_root,
             &value.local_node_id,
@@ -443,6 +736,23 @@ impl Adapter for ClaudeAdapter {
             value.resources,
         )?;
         transport.ensure_no_pending_transaction(&value.state_root, "claude")?;
+        ensure_activity(local, remote_root, transport, &value.activity)?;
+        if let Some(basis) = &value.memory_basis {
+            let current = memory_basis(
+                local,
+                remote_root,
+                transport,
+                &value.local_node_id,
+                &value.remote_node_id,
+                value.resources,
+            )?;
+            if current.scope != basis.scope
+                || current.local != basis.local
+                || current.remote != basis.remote
+            {
+                bail!("Claude memory baseline changed after preview; rerun sync");
+            }
+        }
         if inventory(local, exclude)?.generation != value.local_fingerprint {
             bail!("local Claude data changed after preview");
         }
@@ -451,11 +761,12 @@ impl Adapter for ClaudeAdapter {
             remote_root,
             value.resources,
             &value.local_node_id,
+            &value.activity,
         )?;
         if current_remote.generation != value.remote_fingerprint {
             bail!("remote Claude data changed after preview");
         }
-        ensure_no_writers(local, remote_root, transport)?;
+        ensure_activity(local, remote_root, transport, &value.activity)?;
         thread::sleep(Duration::from_secs_f64(options.stability_seconds));
         if inventory(local, exclude)?.generation != value.local_fingerprint {
             bail!("local Claude writer is active");
@@ -465,11 +776,12 @@ impl Adapter for ClaudeAdapter {
             remote_root,
             value.resources,
             &value.local_node_id,
+            &value.activity,
         )?;
         if stable_remote.generation != value.remote_fingerprint {
             bail!("remote Claude writer is active");
         }
-        ensure_no_writers(local, remote_root, transport)?;
+        ensure_activity(local, remote_root, transport, &value.activity)?;
 
         let local_payload = value.temp.path().join("local-payload");
         let remote_payload = value.temp.path().join("remote-payload");
@@ -486,8 +798,29 @@ impl Adapter for ClaudeAdapter {
             PayloadSide::Remote,
         )?;
         let stamp = stamp();
-        let local_backup = backup_local(local, value.resources, &stamp)?;
-        let remote_backup = backup_remote(remote_root, value.resources, &stamp, transport)?;
+        let local_backup = local
+            .join("agent-sync-backups")
+            .join(format!("before-{stamp}.tar.gz"));
+        let members = inventory(local, exclude)?
+            .entries
+            .into_iter()
+            .map(|e| e.path)
+            .collect::<Vec<_>>();
+        create_backup(local, &local_backup, &members)?;
+        let backup: Value = transport.remote_request(&RemoteRequest::Backup {
+            root: remote_root.into(),
+            backup_dir: "agent-sync-backups".into(),
+            stamp: stamp.clone(),
+            members: stable_remote
+                .entries
+                .iter()
+                .map(|e| e.path.clone())
+                .collect(),
+        })?;
+        let remote_backup = backup["path"]
+            .as_str()
+            .context("remote backup omitted path")?
+            .to_owned();
         let result_inventory = inventory(&value.stage, exclude)?;
         let mut journal = crate::state::TransactionJournal::new(
             "claude",
@@ -500,10 +833,12 @@ impl Adapter for ClaudeAdapter {
             &local_backup,
             &remote_backup,
         );
+        ensure_activity(local, remote_root, transport, &value.activity)?;
         transport.save_transaction_pair(&value.state_root, &journal)?;
         install_local(&local_payload, local, value.resources, &transport.rsync)?;
         journal.phase = crate::state::TransactionPhase::LocalApplied;
         transport.save_transaction_pair(&value.state_root, &journal)?;
+        ensure_activity(local, remote_root, transport, &value.activity)?;
         transport.push(&remote_payload, remote_root)?;
         journal.phase = crate::state::TransactionPhase::RemoteApplied;
         transport.save_transaction_pair(&value.state_root, &journal)?;
@@ -511,19 +846,63 @@ impl Adapter for ClaudeAdapter {
             normalize_local_mtimes(&local_payload, local)?;
             normalize_remote_mtimes(&remote_payload, remote_root, transport)?;
         }
-        journal.phase = crate::state::TransactionPhase::Verified;
-        transport.save_transaction_pair(&value.state_root, &journal)?;
-        verify_selected(&value.stage, local, value.resources, "local")?;
+        verify_selected_excluding(
+            &value.stage,
+            local,
+            value.resources,
+            "local",
+            &value.activity,
+        )?;
         let verified_remote = remote_inventory(
             transport,
             remote_root,
             value.resources,
             &value.local_node_id,
+            &value.activity,
         )?;
         verify_remote_inventory(&value.stage, &verified_remote, value.resources)?;
         if value.resources.sessions() {
-            verify_event_mtimes(local, "local")?;
+            verify_remote_event_mtimes(&value.stage, &inventory(local, exclude)?)?;
             verify_remote_event_mtimes(&value.stage, &verified_remote)?;
+        }
+        ensure_activity(local, remote_root, transport, &value.activity)?;
+        journal.phase = crate::state::TransactionPhase::Verified;
+        transport.save_transaction_pair(&value.state_root, &journal)?;
+        if let Some(basis) = &value.memory_basis {
+            let mut baseline = Baseline::capture_agent(
+                "claude",
+                basis.scope.clone(),
+                journal.transaction_id.clone(),
+                &value.stage,
+                &value.activity.sessions,
+                &value.activity.projects,
+            )?;
+            let mut actual = Baseline::capture_agent(
+                "claude",
+                basis.scope.clone(),
+                journal.transaction_id.clone(),
+                local,
+                &value.activity.sessions,
+                &value.activity.projects,
+            )?;
+            if value.memory_reviewed {
+                baseline
+                    .set_review_policy(Some(crate::memory_consistency::CLAUDE_POLICY.into()))?;
+                actual.set_review_policy(baseline.review_policy.clone())?;
+            }
+            if actual != baseline {
+                bail!("local Claude memory baseline differs from verified result");
+            }
+            let _: Value = transport.remote_request(&RemoteRequest::SaveMemoryBaseline {
+                agent: "claude".into(),
+                root: remote_root.into(),
+                baseline: baseline.clone(),
+            })?;
+            memory_merge::save_verified(
+                &memory_merge::storage_root_for("claude")?,
+                &baseline,
+                &journal,
+            )?;
         }
         let final_inventory = inventory(local, exclude)?;
         let local_checkpoint = crate::state::Checkpoint::new(
@@ -553,6 +932,13 @@ impl Adapter for ClaudeAdapter {
             &stamp,
         ) {
             println!("{message}");
+        }
+        if !value.activity.sessions.is_empty() || !value.activity.projects.is_empty() {
+            println!(
+                "warning: skipped {} active Claude sessions; memory/shared indexes deferred for {} projects",
+                value.activity.sessions.len(),
+                value.activity.projects.len()
+            );
         }
         println!(
             "complete: Claude synchronized and verified; sparse payloads: local={local_payload_count}, remote={remote_payload_count}; backups: local={}, remote={}:{}",
@@ -596,12 +982,14 @@ fn remote_inventory(
     root: &str,
     resources: ResourceSelection,
     peer_id: &str,
+    activity: &Activity,
 ) -> Result<crate::core::Inventory> {
     transport.remote_request(&RemoteRequest::Inventory {
         root: root.to_owned(),
         agent: "claude".to_owned(),
         resources,
-        excluded_ids: Vec::new(),
+        excluded_ids: activity.sessions.iter().cloned().collect(),
+        excluded_projects: activity.projects.iter().cloned().collect(),
         peer_id: peer_id.to_owned(),
     })
 }
@@ -656,11 +1044,8 @@ pub(crate) fn validate_archive_snapshot(root: &Path, resources: ResourceSelectio
 }
 
 pub(crate) fn local_has_writers(root: &Path) -> Result<bool> {
-    let output = Command::new("/usr/sbin/lsof")
-        .args(["-Fpf", "+D"])
-        .arg(root.join("projects"))
-        .output()?;
-    Ok(!parse_lsof_writers(&String::from_utf8_lossy(&output.stdout)).is_empty())
+    let activity = claude_activity::detect(root)?;
+    Ok(!activity.sessions.is_empty() || !activity.projects.is_empty())
 }
 
 pub(crate) fn archive_backup(
@@ -793,31 +1178,7 @@ fn validate_claude_jsonl(path: &Path, relative: &Path) -> Result<i64> {
         .context("Claude JSONL has no event timestamp")
 }
 
-fn build_stage(
-    local: &Path,
-    remote: &Path,
-    stage: &Path,
-    resources: ResourceSelection,
-    choices: &BTreeMap<(String, String), MemoryChoice>,
-    peer: &str,
-    strategy: ConflictStrategy,
-) -> Result<(PlanReport, Vec<MemoryConflict>)> {
-    build_stage_full(local, remote, stage, resources, choices, peer, strategy)
-}
-
-fn build_stage_from_choices(
-    remote: &Path,
-    stage: &Path,
-    resources: ResourceSelection,
-    choices: &BTreeMap<(String, String), MemoryChoice>,
-    peer: &str,
-    strategy: ConflictStrategy,
-) -> Result<(PlanReport, Vec<MemoryConflict>)> {
-    // The original local tree is retained next to the remote snapshot by prepare.
-    let local = stage.parent().context("stage parent")?.join("local-copy");
-    build_stage_full(&local, remote, stage, resources, choices, peer, strategy)
-}
-
+#[cfg(test)]
 fn build_stage_full(
     local: &Path,
     remote: &Path,
@@ -826,6 +1187,22 @@ fn build_stage_full(
     choices: &BTreeMap<(String, String), MemoryChoice>,
     peer: &str,
     strategy: ConflictStrategy,
+) -> Result<(PlanReport, Vec<MemoryConflict>)> {
+    build_stage_with_base(
+        local, remote, stage, resources, choices, peer, strategy, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stage_with_base(
+    local: &Path,
+    remote: &Path,
+    stage: &Path,
+    resources: ResourceSelection,
+    choices: &BTreeMap<(String, String), MemoryChoice>,
+    peer: &str,
+    strategy: ConflictStrategy,
+    baseline: Option<&Baseline>,
 ) -> Result<(PlanReport, Vec<MemoryConflict>)> {
     let mut report = PlanReport {
         agent: "claude".into(),
@@ -948,6 +1325,7 @@ fn build_stage_full(
             strategy,
             &mut report,
             &mut conflicts,
+            baseline,
         )?;
     }
     report.files = planned_file_changes(local, remote, stage, |path| excluded(path, resources))?;
@@ -1007,7 +1385,7 @@ fn file_prefix(shorter: &FileRecord, longer: &FileRecord) -> Result<bool> {
     }
 }
 
-fn session_bundle_identity(path: &Path) -> Option<(String, String)> {
+pub(crate) fn session_bundle_identity(path: &Path) -> Option<(String, String)> {
     let parts = path.iter().collect::<Vec<_>>();
     if parts.len() < 3 || parts[0] != "projects" {
         return None;
@@ -1203,6 +1581,7 @@ fn copy_tree_selected(source: &Path, dest: &Path, resources: ResourceSelection) 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_memories(
     local: &Path,
     remote: &Path,
@@ -1211,6 +1590,7 @@ fn merge_memories(
     strategy: ConflictStrategy,
     report: &mut PlanReport,
     conflicts: &mut Vec<MemoryConflict>,
+    baseline: Option<&Baseline>,
 ) -> Result<()> {
     let projects = project_names(local)?
         .union(&project_names(remote)?)
@@ -1228,6 +1608,47 @@ fn merge_memories(
         }
         let li = memory_index(&lm, &lf)?;
         let ri = memory_index(&rm, &rf)?;
+        let prefix = format!("projects/{project}/memory/");
+        let bi = baseline_index(baseline, &project)?;
+        let preamble = match choices.get(&(project.clone(), "MEMORY.md".into())) {
+            Some(MemoryChoice::Side(Side::Local)) => li.preamble.clone(),
+            Some(MemoryChoice::Side(Side::Remote)) => ri.preamble.clone(),
+            Some(MemoryChoice::Edited { content, .. }) => content.clone(),
+            None if li.preamble == ri.preamble => li.preamble.clone(),
+            None if !local_index_exists => ri.preamble.clone(),
+            None if !remote_index_exists => li.preamble.clone(),
+            None if strategy == ConflictStrategy::Local => li.preamble.clone(),
+            None if strategy == ConflictStrategy::Remote => ri.preamble.clone(),
+            None => {
+                let result = crate::memory_resolver::resolve(
+                    &crate::memory_resolver::MergeConfig::default(),
+                    Path::new(&format!("{prefix}MEMORY.md")),
+                    bi.as_ref().map(|i| i.preamble.as_str()),
+                    &li.preamble,
+                    &ri.preamble,
+                )?;
+                if let Some(text) = result.text {
+                    text
+                } else {
+                    conflicts.push(MemoryConflict {
+                        project: project.clone(),
+                        target: "MEMORY.md".into(),
+                        local_content: li.preamble.clone(),
+                        remote_content: ri.preamble.clone(),
+                        local_index: String::new(),
+                        remote_index: String::new(),
+                        content_requires_choice: true,
+                        index_requires_choice: false,
+                    });
+                    report.blockers.push(Blocker {
+                        resource: "memory".into(),
+                        path: format!("{project}/MEMORY.md"),
+                        reason: "memory index preamble requires a choice".into(),
+                    });
+                    li.preamble.clone()
+                }
+            }
+        };
         let mut selected = BTreeMap::new();
         for target in lf.keys().chain(rf.keys()).cloned().collect::<BTreeSet<_>>() {
             if lf.contains_key(&target) && !rf.contains_key(&target) {
@@ -1282,7 +1703,18 @@ fn merge_memories(
             {
                 let local_bytes = fs::read(local)?;
                 let remote_bytes = fs::read(remote)?;
-                if remote_bytes.starts_with(&local_bytes) {
+                if strategy == ConflictStrategy::Ask && explicit_choice.is_none() {
+                    merged_content = crate::memory_resolver::resolve(
+                        &crate::memory_resolver::MergeConfig::default(),
+                        Path::new(&format!("{prefix}{target}")),
+                        baseline
+                            .and_then(|b| b.files.get(&format!("{prefix}{target}")))
+                            .map(String::as_str),
+                        std::str::from_utf8(&local_bytes)?,
+                        std::str::from_utf8(&remote_bytes)?,
+                    )?
+                    .text;
+                } else if remote_bytes.starts_with(&local_bytes) {
                     content_side = Some(Side::Remote);
                 } else if local_bytes.starts_with(&remote_bytes) {
                     content_side = Some(Side::Local);
@@ -1298,6 +1730,23 @@ fn merge_memories(
                     }
                 }
             }
+            let merged_index = if index_differs
+                && strategy == ConflictStrategy::Ask
+                && explicit_choice.is_none()
+            {
+                crate::memory_resolver::resolve(
+                    &crate::memory_resolver::MergeConfig::default(),
+                    Path::new(&format!("{prefix}{target}.index.md")),
+                    bi.as_ref()
+                        .and_then(|i| i.items.get(&target))
+                        .map(String::as_str),
+                    left.unwrap(),
+                    right.unwrap(),
+                )?
+                .text
+            } else {
+                None
+            };
             let index_side = if index_differs {
                 content_side.or(policy_side)
             } else {
@@ -1305,13 +1754,20 @@ fn merge_memories(
             };
             let content_requires_choice =
                 content_differs && merged_content.is_none() && content_side.is_none();
-            let index_requires_choice = index_differs && index_side.is_none();
+            let index_requires_choice =
+                index_differs && merged_index.is_none() && index_side.is_none();
             let mut unresolved = false;
             if let (Some(local_path), Some(remote_path)) = (local_file, remote_file)
                 && (content_requires_choice || index_requires_choice)
             {
-                let local_block = left.cloned().unwrap_or_default();
-                let remote_block = right.cloned().unwrap_or_default();
+                let local_block = merged_index
+                    .clone()
+                    .or_else(|| left.cloned())
+                    .unwrap_or_default();
+                let remote_block = merged_index
+                    .clone()
+                    .or_else(|| right.cloned())
+                    .unwrap_or_default();
                 conflicts.push(MemoryConflict {
                     project: project.clone(),
                     target: target.clone(),
@@ -1334,12 +1790,16 @@ fn merge_memories(
                 Some(Side::Remote) | None => remote_file.or(local_file),
             }
             .context("memory source disappeared")?;
-            let block = match match index_side {
-                Some(Side::Local) => left.or(right),
-                Some(Side::Remote) | None => right.or(left),
-            } {
-                Some(block) => block.clone(),
-                None => synthesize_block(source, &target)?,
+            let block = if let Some(index) = merged_index {
+                index
+            } else {
+                match match index_side {
+                    Some(Side::Local) => left.or(right),
+                    Some(Side::Remote) | None => right.or(left),
+                } {
+                    Some(block) => block.clone(),
+                    None => synthesize_block(source, &target)?,
+                }
             };
             if content_differs
                 && !unresolved
@@ -1373,11 +1833,6 @@ fn merge_memories(
         }
         let mut ordered: Vec<_> = selected.into_iter().collect();
         ordered.sort_by_key(|(name, (_, time))| (*time, name.clone()));
-        let preamble = if !ri.preamble.trim().is_empty() {
-            &ri.preamble
-        } else {
-            &li.preamble
-        };
         let mut index = preamble.trim_end().to_owned();
         if !index.is_empty() {
             index.push_str("\n\n");
@@ -1392,6 +1847,8 @@ fn merge_memories(
             .join("memory/MEMORY.md");
         private_dir(path.parent().unwrap())?;
         fs::write(path, index)?;
+        let memory = stage.join("projects").join(&project).join("memory");
+        memory_index(&memory, &memory_files(&memory)?)?;
     }
     Ok(())
 }
@@ -1487,12 +1944,24 @@ struct MemoryIndex {
 }
 
 fn memory_index(root: &Path, files: &BTreeMap<String, PathBuf>) -> Result<MemoryIndex> {
+    let path = root.join("MEMORY.md");
+    let text = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    parse_memory_index(&text, files, true)
+}
+
+fn parse_memory_index(
+    text: &str,
+    files: &BTreeMap<String, PathBuf>,
+    synthesize: bool,
+) -> Result<MemoryIndex> {
     let mut items = BTreeMap::new();
     let mut preamble = String::new();
-    let path = root.join("MEMORY.md");
-    if path.exists() {
+    {
         let item_re = Regex::new(r"^- \[[^]]+\]\(([^)]+\.md)\)(?:\s+—\s+.*)?$")?;
-        let text = fs::read_to_string(path)?;
         let mut current: Vec<String> = Vec::new();
         for line in text.lines() {
             if item_re.is_match(line) && !current.is_empty() {
@@ -1511,7 +1980,7 @@ fn memory_index(root: &Path, files: &BTreeMap<String, PathBuf>) -> Result<Memory
         }
     }
     for (name, file) in files {
-        if !items.contains_key(name) {
+        if synthesize && !items.contains_key(name) {
             items.insert(name.clone(), synthesize_block(file, name)?);
         }
     }
@@ -1558,39 +2027,6 @@ fn synthesize_block(path: &Path, target: &str) -> Result<String> {
             path.display()
         ))?;
     Ok(format!("- [{name}]({target}) — {description}\n"))
-}
-
-fn ensure_no_writers(local: &Path, remote: &str, transport: &SshTransport) -> Result<()> {
-    let local_out = Command::new("/usr/sbin/lsof")
-        .args(["-Fpf", "+D"])
-        .arg(local.join("projects"))
-        .output()?;
-    if !parse_lsof_writers(&String::from_utf8_lossy(&local_out.stdout)).is_empty() {
-        bail!("local Claude files are open")
-    }
-    let value: Value = transport.remote_request(&RemoteRequest::ClaudeWriters {
-        root: remote.to_owned(),
-    })?;
-    if value["active"].as_bool().unwrap_or(true) {
-        bail!("remote Claude files are open")
-    }
-    Ok(())
-}
-
-fn parse_lsof_writers(output: &str) -> BTreeSet<String> {
-    let re = Regex::new(r"^f\d+[wu].*").expect("static regex");
-    let mut current = None;
-    let mut writers = BTreeSet::new();
-    for line in output.lines() {
-        if let Some(pid) = line.strip_prefix('p') {
-            current = Some(pid.to_owned());
-        } else if re.is_match(line)
-            && let Some(pid) = &current
-        {
-            writers.insert(pid.clone());
-        }
-    }
-    writers
 }
 
 fn verify_event_mtimes(root: &Path, side: &str) -> Result<()> {
@@ -1658,24 +2094,6 @@ fn backup_local(root: &Path, resources: ResourceSelection, stamp: &str) -> Resul
     create_backup(root, &out, &["projects".to_owned()])?;
     Ok(out)
 }
-fn backup_remote(
-    root: &str,
-    _resources: ResourceSelection,
-    stamp: &str,
-    t: &SshTransport,
-) -> Result<String> {
-    #[derive(serde::Deserialize)]
-    struct BackupResult {
-        path: String,
-    }
-    let value: BackupResult = t.remote_request(&RemoteRequest::Backup {
-        root: root.to_owned(),
-        backup_dir: "agent-sync-backups".to_owned(),
-        stamp: stamp.to_owned(),
-        members: vec!["projects".to_owned()],
-    })?;
-    Ok(value.path)
-}
 fn install_local(
     stage: &Path,
     root: &Path,
@@ -1692,11 +2110,16 @@ fn install_local(
     }
     Ok(())
 }
-fn verify_selected(stage: &Path, actual: &Path, r: ResourceSelection, side: &str) -> Result<()> {
-    let a = manifest(stage, |p| excluded(p, r))?;
-    let b = manifest(actual, |p| excluded(p, r))?;
-    if a != b {
-        bail!("{side} final file set or content differs from the staged manifest");
+fn verify_selected_excluding(
+    stage: &Path,
+    actual: &Path,
+    resources: ResourceSelection,
+    side: &str,
+    activity: &Activity,
+) -> Result<()> {
+    let exclude = |p: &Path| excluded(p, resources) || activity.excludes(p);
+    if manifest(stage, exclude)? != manifest(actual, exclude)? {
+        bail!("{side} final file set or content differs from staged Claude manifest");
     }
     Ok(())
 }
@@ -1742,6 +2165,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn planning_snapshots_are_detached_and_reject_changed_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let view = temp.path().join("view");
+        fs::create_dir_all(source.join("projects/project/memory")).unwrap();
+        let relative = "projects/project/memory/note.md";
+        fs::write(source.join(relative), "original evidence").unwrap();
+        let original = inventory(&source, |_| false).unwrap();
+        snapshot_selected(&source, &view, &original).unwrap();
+        fs::write(source.join(relative), "changed evidence").unwrap();
+        assert_eq!(
+            fs::read_to_string(view.join(relative)).unwrap(),
+            "original evidence"
+        );
+        assert!(snapshot_selected(&source, &temp.path().join("stale"), &original).is_err());
+    }
+
+    #[test]
     fn semantic_backend_validates_memory_and_index_as_a_bundle() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -1774,7 +2215,7 @@ pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(jso
             content_requires_choice: true,
             index_requires_choice: true,
         };
-        let choice = resolve_memory_with_backend(&conflict, &stage, temp.path(), &config)
+        let choice = resolve_memory_with_backend(&conflict, &stage, temp.path(), &config, None)
             .unwrap()
             .unwrap();
         let MemoryChoice::Edited { content, index } = choice else {
@@ -2284,15 +2725,6 @@ pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(jso
         assert_eq!(
             parsed.items["topic.md"],
             "- [Topic](topic.md) — Desc\n  continuation\n"
-        );
-    }
-
-    #[test]
-    fn lsof_parser_ignores_read_only_descriptors() {
-        let output = "p10\nf3r\np11\nf8u\np12\nf4w\n";
-        assert_eq!(
-            parse_lsof_writers(output),
-            BTreeSet::from(["11".to_owned(), "12".to_owned()])
         );
     }
 

@@ -215,6 +215,39 @@ retain non-empty `name` and `description` frontmatter, and the index entry must
 link to the memory file exactly once. Real local and remote files remain
 unchanged until the resolved plan is shown and `[Y/n]` is confirmed.
 
+### Claude active sessions and memory baselines
+
+Claude automatically skips live session bundles using its `sessions/*.json`
+process registry and write descriptors reported by `lsof`. The union of both
+endpoints' active IDs is excluded from inventory, transfer, staging, backups,
+verification, and checkpoints. Subagents and tool results follow their parent
+session. Memory and shared indexes for affected projects are deferred too;
+inactive sessions in those projects can still synchronize. This does not use a
+recent-mtime heuristic, so a newly created but closed session remains eligible.
+Unknown writer scope or failed writer inspection refuses the operation. Activity
+is checked again under endpoint locks and around writes; newly active data stops
+apply and requires a fresh preview. Writers are never stopped automatically.
+
+Under `ask`, Claude memory uses the same verified paired-baseline diff3 and
+optional semantic backend as Codex. One-sided and disjoint edits merge without a
+model call; missing or mismatching baselines permit only independent unchanged
+sections. Shared ambiguous text still requires a choice or an explicitly
+configured backend. Baselines live in the OS local data directory under
+`agent-sync/memory-baselines/claude`, separate from Codex and hash caches, and
+advance only after full two-endpoint verification. Old Codex baselines remain
+compatible. `all` and `memory` selections have separate baselines.
+
+The baseline covers memory bodies, index entries, and the index preamble;
+preamble differences are no longer silently selected from one side. Localized
+editor markers preserve equal context. With a semantic backend configured,
+project memory leaves and their index also receive cross-file consistency review
+against immutable original memory snapshots. Exact evidence, fingerprint and
+manual-choice protections match Codex; the Claude bundle validator still checks
+index references. Matching reviewed baselines can reuse completed review, while
+changed original evidence forces rechecking. Session logs and arbitrary linked
+paths are never supplied as memory evidence. Deferred projects are omitted from
+both merge baselines and review.
+
 OpenCode currently synchronizes sessions only. It reads and writes sessions
 through the official `opencode export` and `opencode import` commands instead
 of copying the database. Linear histories take the longer version; true
@@ -297,7 +330,7 @@ used for preview while holding both endpoint locks. An interrupted baseline
 publication leaves mismatching copies unusable; it does not bypass transaction
 recovery. Baseline content travels through the typed helper protocol, separately
 from rsync; preview reports its UTF-8 content size separately from rsync wire
-statistics. The helper protocol is now version 7.
+statistics. The helper protocol is now version 8.
 
 ## Optional memory merge backends
 
@@ -435,7 +468,7 @@ groups are deferred, and previously deferred groups must be reviewed when they
 become inactive. Unchanged reviewed data reuses that durable approval without a
 model call. Preview alone does not publish approval; repeated previews before
 apply can invoke the backend again. Scan checkpoints never authorize skipping
-review. The helper protocol is version 7 for the review-baseline extension.
+review. The helper protocol is version 8 for activity exclusions and agent-scoped review baselines.
 
 Protocol references: [OpenCode CLI](https://opencode.ai/docs/cli/),
 [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
@@ -570,7 +603,8 @@ OpenCode 当前只同步 session，通过官方 `export`/`import` 接口工作�
 
 同步使用两端 manifest、增量 rsync 和 per-peer checkpoint，稳定状态下不会重复
 下载或重新计算未变化内容。共享 SSH 链路可以使用 `--bwlimit <KiB/s>` 限速。
-Codex 正在写入的 session 会被警告并跳过，其他内容继续同步；Claude 和
+Codex 和 Claude 的活动 session 会被警告并跳过。Claude 同时延后相关项目的
+记忆和共享索引，并在写入前重新检查活动范围；无法识别或新出现的写入会阻止 apply。
 OpenCode 在检测到 writer 时拒绝 apply。损坏的 checkpoint 会自动退化为重新
 扫描；未完成的事务 journal 则会阻止继续写入，并输出两端备份位置供恢复。
 

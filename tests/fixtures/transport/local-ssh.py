@@ -12,4 +12,14 @@ env = dict(os.environ, HOME=remote_home,
 command = " ".join(sys.argv[2:])
 if os.path.exists(remote_home + "/fail-push") and "--server" in command and "--sender" not in command:
     sys.exit(42)
-sys.exit(subprocess.call(["/bin/sh", "-c", command], env=env, cwd=remote_home))
+status = subprocess.call(["/bin/sh", "-c", command], env=env, cwd=remote_home)
+# Test-only fault after a successful receiver write, before manifest readback.
+marker = os.path.join(remote_home, "corrupt-after-push")
+if status == 0 and "--server" in command and "--sender" not in command and os.path.exists(marker):
+    with open(marker) as handle:
+        target = os.path.realpath(os.path.join(remote_home, handle.read().strip()))
+    if os.path.commonpath([os.path.realpath(remote_home), target]) != os.path.realpath(remote_home):
+        raise RuntimeError("fault target escapes isolated home")
+    with open(target, "ab") as handle:
+        handle.write(b"\ncorrupted after push\n")
+sys.exit(status)

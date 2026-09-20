@@ -60,15 +60,15 @@ fn help_documents_read_only_default() {
 fn remote_helper_negotiates_the_typed_protocol() {
     let output = Command::cargo_bin("agent-sync")
         .unwrap()
-        .args(["__remote", "--protocol", "7"])
+        .args(["__remote", "--protocol", "8"])
         .write_stdin("{\"op\":\"ping\"}\n")
         .output()
         .unwrap();
     assert!(output.status.success());
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["protocol"], 7);
+    assert_eq!(response["protocol"], 8);
     assert_eq!(response["ok"], true);
-    assert_eq!(response["value"]["protocol"], 7);
+    assert_eq!(response["value"]["protocol"], 8);
     assert!(response["value"]["executable_sha256"].as_str().is_some());
 }
 
@@ -76,12 +76,12 @@ fn remote_helper_negotiates_the_typed_protocol() {
 fn remote_helper_rejects_an_old_protocol() {
     Command::cargo_bin("agent-sync")
         .unwrap()
-        .args(["__remote", "--protocol", "6"])
+        .args(["__remote", "--protocol", "7"])
         .write_stdin("{\"op\":\"ping\"}\n")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "unsupported protocol 6; expected 7",
+            "unsupported protocol 7; expected 8",
         ));
 }
 
@@ -696,4 +696,306 @@ pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(jso
     let plan: Value = serde_json::from_slice(&failed.stdout).unwrap();
     assert_eq!(plan["blockers"][0]["resource"], "memory-consistency");
     assert_eq!(baselines(), verified);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_active_bundles_are_untouched_and_verified_memory_bases_merge_edits() {
+    use std::{fs, path::Path};
+    let temp = tempfile::tempdir().unwrap();
+    let lh = temp.path().join("local-home");
+    let rh = temp.path().join("remote-home");
+    let local = lh.join("claude");
+    let remote = rh.join("claude");
+    let active = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+    let idle = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef06";
+    let active_rel = format!("projects/project/{active}.jsonl");
+    let idle_rel = format!("projects/project/{idle}.jsonl");
+    let note = "projects/other/memory/note.md";
+    let index = "projects/other/memory/MEMORY.md";
+    let initial = "---\nname: note\ndescription: shared facts\n---\n\n# First\nbase first\n\n# Second\nbase second\n";
+    for (root, live) in [
+        (&local, "local live partial"),
+        (&remote, "remote live partial"),
+    ] {
+        fs::create_dir_all(root.join("projects/project/memory")).unwrap();
+        fs::create_dir_all(root.join("projects/other/memory")).unwrap();
+        fs::write(root.join(&active_rel), live).unwrap();
+        fs::write(
+            root.join("projects/project/memory/MEMORY.md"),
+            "invalid active index [missing](missing.md)",
+        )
+        .unwrap();
+        fs::write(root.join(note), initial).unwrap();
+        fs::write(
+            root.join(index),
+            "# Memory\n\n- [note](note.md) — shared facts\n",
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(remote.join("sessions")).unwrap();
+    fs::write(
+        remote.join("sessions/live.json"),
+        serde_json::json!({"pid":std::process::id(),"sessionId":active}).to_string(),
+    )
+    .unwrap();
+    fs::write(local.join(&idle_rel), format!("{{\"type\":\"user\",\"sessionId\":\"{idle}\",\"timestamp\":\"2026-08-11T00:00:00Z\"}}\n")).unwrap();
+    let originals: Vec<_> = [&local, &remote]
+        .iter()
+        .map(|root| {
+            (
+                fs::read(root.join(&active_rel)).unwrap(),
+                fs::metadata(root.join(&active_rel))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let ssh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transport/local-ssh.py");
+    let run = |extra: &[&str]| {
+        Command::cargo_bin("agent-sync")
+            .unwrap()
+            .env("HOME", &lh)
+            .env("XDG_CACHE_HOME", lh.join(".cache"))
+            .env("XDG_DATA_HOME", lh.join(".local/share"))
+            .env("XDG_CONFIG_HOME", lh.join(".config"))
+            .env("AGENT_SYNC_TEST_REMOTE_HOME", &rh)
+            .env_remove("AGENT_SYNC_CONFIG")
+            .args(["sync", "claude", "fixture", "-t", "0", "-s", "ask"])
+            .arg("--local-root")
+            .arg(&local)
+            .arg("--remote-root")
+            .arg(&remote)
+            .arg("--ssh")
+            .arg(&ssh)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let preview = run(&["-f", "json"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert!(
+        plan["notes"]
+            .to_string()
+            .contains("active sessions skipped: 1")
+    );
+    assert!(!plan["files"].to_string().contains(active));
+    assert!(
+        !plan["files"]
+            .to_string()
+            .contains("projects/project/memory")
+    );
+    let apply = run(&["--apply", "--yes"]);
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    for (n, root) in [&local, &remote].iter().enumerate() {
+        assert_eq!(fs::read(root.join(&active_rel)).unwrap(), originals[n].0);
+        assert_eq!(
+            fs::metadata(root.join(&active_rel))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            originals[n].1
+        );
+        assert_eq!(
+            fs::read(root.join(&idle_rel)).unwrap(),
+            fs::read(local.join(&idle_rel)).unwrap()
+        );
+    }
+    fs::write(
+        local.join(note),
+        initial.replace("base first", "local first"),
+    )
+    .unwrap();
+    fs::write(
+        remote.join(note),
+        initial.replace("base second", "remote second"),
+    )
+    .unwrap();
+    // Simultaneously advance the shared index on just one side.
+    fs::write(
+        remote.join(index),
+        "# Shared Memory\n\n- [note](note.md) — updated facts\n",
+    )
+    .unwrap();
+    let preview = run(&["-f", "json"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let apply = run(&["--apply", "--yes"]);
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    for root in [&local, &remote] {
+        let text = fs::read_to_string(root.join(note)).unwrap();
+        assert!(text.contains("local first") && text.contains("remote second"));
+        assert!(
+            fs::read_to_string(root.join(index))
+                .unwrap()
+                .starts_with("# Shared Memory")
+        );
+        assert!(
+            fs::read_to_string(root.join(index))
+                .unwrap()
+                .contains("updated facts")
+        );
+    }
+    let rerun = run(&["-f", "json"]);
+    assert!(
+        rerun.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&rerun.stdout).unwrap();
+    assert_eq!(plan["files"], serde_json::json!([]));
+    assert_eq!(plan["blockers"], serde_json::json!([]));
+    // Verified baselines must exist, be Claude-scoped, and omit active projects.
+    let bases: Vec<_> = walkdir::WalkDir::new(&lh)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path()
+                    .to_string_lossy()
+                    .contains("memory-baselines/claude/")
+        })
+        .collect();
+    assert_eq!(bases.len(), 1);
+    let baseline: Value = serde_json::from_slice(&fs::read(bases[0].path()).unwrap()).unwrap();
+    assert_eq!(baseline["agent"], "claude");
+    assert!(!baseline["files"].to_string().contains("projects/project/"));
+    let saved_base = fs::read(bases[0].path()).unwrap();
+    let new_text = fs::read_to_string(local.join(note))
+        .unwrap()
+        .replace("local first", "later first");
+    fs::write(local.join(note), &new_text).unwrap();
+    fs::write(bases[0].path(), b"corrupt baseline").unwrap();
+    let fallback = run(&["-f", "json"]);
+    assert_eq!(fallback.status.code(), Some(2));
+    let fallback: Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    assert!(
+        fallback["notes"]
+            .to_string()
+            .contains("no matching verified baseline")
+    );
+    fs::remove_file(bases[0].path()).unwrap();
+    assert_eq!(run(&["-f", "json"]).status.code(), Some(2));
+    fs::write(bases[0].path(), &saved_base).unwrap();
+    assert!(run(&["-f", "json"]).status.success());
+    // Simulate a failed remote write: neither baseline may advance and the
+    // durable journal must remain unverified, gating the next apply.
+    fs::write(rh.join("fail-push"), "injected failure").unwrap();
+    assert!(!run(&["--apply", "--yes"]).status.success());
+    assert_eq!(fs::read(bases[0].path()).unwrap(), saved_base);
+    let journals: Vec<_> = walkdir::WalkDir::new(&lh)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file() && e.path().ends_with("transactions/claude/current.json")
+        })
+        .collect();
+    assert_eq!(journals.len(), 1);
+    let journal: Value = serde_json::from_slice(&fs::read(journals[0].path()).unwrap()).unwrap();
+    assert_eq!(journal["phase"], "local_applied");
+    fs::remove_file(rh.join("fail-push")).unwrap();
+    assert!(!run(&["--apply", "--yes"]).status.success());
+    assert_eq!(fs::read(bases[0].path()).unwrap(), saved_base);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_failed_final_verification_never_marks_journals_or_baselines_verified() {
+    use std::{fs, path::Path};
+    let temp = tempfile::tempdir().unwrap();
+    let lh = temp.path().join("local-home");
+    let rh = temp.path().join("remote-home");
+    let local = lh.join("claude");
+    let remote = rh.join("claude");
+    let rel = "projects/project/memory/note.md";
+    for root in [&local, &remote] {
+        fs::create_dir_all(root.join("projects/project/memory")).unwrap();
+        fs::write(
+            root.join(rel),
+            "---\nname: note\ndescription: facts\n---\noriginal\n",
+        )
+        .unwrap();
+    }
+    let ssh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transport/local-ssh.py");
+    let run = || {
+        Command::cargo_bin("agent-sync")
+            .unwrap()
+            .env("HOME", &lh)
+            .env("XDG_CACHE_HOME", lh.join(".cache"))
+            .env("XDG_DATA_HOME", lh.join(".local/share"))
+            .env("XDG_CONFIG_HOME", lh.join(".config"))
+            .env("AGENT_SYNC_TEST_REMOTE_HOME", &rh)
+            .env_remove("AGENT_SYNC_CONFIG")
+            .args([
+                "sync", "claude", "fixture", "-o", "memory", "-t", "0", "--apply", "--yes",
+            ])
+            .arg("--local-root")
+            .arg(&local)
+            .arg("--remote-root")
+            .arg(&remote)
+            .arg("--ssh")
+            .arg(&ssh)
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let bases: Vec<_> = walkdir::WalkDir::new(temp.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path()
+                    .to_string_lossy()
+                    .contains("memory-baselines/claude/")
+        })
+        .map(|e| (e.path().to_path_buf(), fs::read(e.path()).unwrap()))
+        .collect();
+    assert_eq!(bases.len(), 2);
+    assert_eq!(bases[0].1, bases[1].1);
+    fs::write(
+        local.join(rel),
+        "---\nname: note\ndescription: facts\n---\nadvanced\n",
+    )
+    .unwrap();
+    fs::write(rh.join("corrupt-after-push"), format!("claude/{rel}")).unwrap();
+    let failure = run();
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("final file set or content differs"));
+    for (path, original) in bases {
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+    let journals: Vec<_> = walkdir::WalkDir::new(temp.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file() && e.path().ends_with("transactions/claude/current.json")
+        })
+        .collect();
+    assert_eq!(journals.len(), 2);
+    for journal in journals {
+        let d: Value = serde_json::from_slice(&fs::read(journal.path()).unwrap()).unwrap();
+        assert_eq!(d["phase"], "remote_applied");
+    }
 }

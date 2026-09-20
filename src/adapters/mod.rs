@@ -1,4 +1,5 @@
 pub(crate) mod claude;
+pub(crate) mod claude_activity;
 pub(crate) mod codex;
 pub(crate) mod opencode;
 

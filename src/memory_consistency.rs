@@ -11,6 +11,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+pub const CLAUDE_POLICY: &str = "claude-project-memory-consistency-v1";
+
 pub const POLICY: &str = "codex-linked-memory-consistency-v1";
 
 #[derive(Clone, Serialize)]
@@ -72,8 +74,8 @@ Preserve thread IDs, source links, headings, frontmatter and qualifications. Ove
 concern ONLY the supplied source thread IDs. Do not repair unrelated overview topics.
 Return exact unique text replacements, preferably the entire affected sentence/bullet. Each edit
 needs a verbatim evidence quote of at least 12 characters from a DIFFERENT, UNEDITED unit. Evidence
-must come from an original snapshot unit with writable=false and kind raw or leaf, never
-from a writable, newly merged unit or from a catalog/overview. Never edit read-only evidence. Before/after
+must come from an original snapshot unit with writable=false and kind raw, leaf, or claude_leaf, never
+from a writable, newly merged unit or from a catalog/overview/index. Claude project memory leaves and their MEMORY.md index are grouped by project; check scope and frontmatter as well as index descriptions. Never edit read-only evidence. Before/after
 replacements must each be at most 4096 UTF-8 bytes; prefer one complete, unique sentence or bullet.
 Evidence quotes must actually support the replacement, not merely mention the same topic. Never invent
 an evidence quote or use circular support. Do not change source observations just to manufacture
@@ -104,8 +106,11 @@ fn schema() -> Value {
 fn collect(stage: &Path) -> Result<(BTreeMap<String, String>, BTreeMap<String, Unit>)> {
     let mut files = BTreeMap::new();
     let mut units = BTreeMap::new();
-    let root = stage.join("memories");
-    for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+    let roots = [stage.join("memories"), stage.join("projects")];
+    for entry in roots
+        .iter()
+        .flat_map(|root| walkdir::WalkDir::new(root).follow_links(false))
+    {
         let entry = match entry {
             Ok(e) => e,
             Err(e)
@@ -128,7 +133,9 @@ fn collect(stage: &Path) -> Result<(BTreeMap<String, String>, BTreeMap<String, U
             .to_str()
             .context("non-UTF-8 memory path")?
             .to_owned();
-        if !crate::memory_merge::eligible(Path::new(&path)) {
+        if !crate::memory_merge::eligible(Path::new(&path))
+            && !crate::memory_merge::eligible_for("claude", Path::new(&path))
+        {
             continue;
         }
         let Ok(text) = fs::read_to_string(entry.path()) else {
@@ -138,7 +145,24 @@ fn collect(stage: &Path) -> Result<(BTreeMap<String, String>, BTreeMap<String, U
             continue;
         }
         let sections: Vec<(String, String, BTreeSet<String>)> =
-            if path == "memories/raw_memories.md" {
+            if crate::memory_merge::eligible_for("claude", Path::new(&path)) {
+                let project = Path::new(&path)
+                    .components()
+                    .nth(1)
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy();
+                let kind = if path.ends_with("/MEMORY.md") {
+                    "claude_index"
+                } else {
+                    "claude_leaf"
+                };
+                vec![(
+                    format!("{kind}:{path}"),
+                    text.clone(),
+                    BTreeSet::from([format!("claude-project:{project}")]),
+                )]
+            } else if path == "memories/raw_memories.md" {
                 if text.trim().is_empty() {
                     vec![]
                 } else {
@@ -278,7 +302,7 @@ fn validate_answer(
                 .get(&witness.unit)
                 .context("unknown consistency evidence unit")?;
             if source.writable
-                || !matches!(source.kind.as_str(), "raw" | "leaf")
+                || !matches!(source.kind.as_str(), "raw" | "leaf" | "claude_leaf")
                 || source.path == unit.path
                 || edited_ids.contains(witness.unit.as_str())
                 || witness.quote.chars().count() < 12
@@ -372,13 +396,18 @@ pub fn review_with_protected(
         });
     }
     let (files, original) = collect(stage)?;
+    let policy = if files.keys().any(|p| p.starts_with("projects/")) {
+        CLAUDE_POLICY
+    } else {
+        POLICY
+    };
     let mut evidence = BTreeMap::new();
     let mut evidence_versions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for root in evidence_roots {
         let (source_files, source_units) = collect(root)?;
         for mut unit in source_units
             .into_values()
-            .filter(|u| matches!(u.kind.as_str(), "raw" | "leaf"))
+            .filter(|u| matches!(u.kind.as_str(), "raw" | "leaf" | "claude_leaf"))
         {
             let id = format!(
                 "source:{}",
@@ -419,7 +448,7 @@ pub fn review_with_protected(
             .cloned()
             .collect();
         let unchanged = baseline.is_some_and(|base| {
-            base.review_policy.as_deref() == Some(POLICY)
+            base.review_policy.as_deref() == Some(policy)
                 && base.files.keys().eq(files.keys())
                 && sources.is_disjoint(&base.excluded_ids)
                 && linked_evidence.iter().all(|u| {
@@ -445,7 +474,7 @@ pub fn review_with_protected(
             .filter(|u| !u.writable)
             .map(|u| (u.path.clone(), evidence_versions[&u.path].clone()))
             .collect();
-        let data = json!({"policy":POLICY,"source_thread_ids":sources,"units":input,"source_file_hashes":source_hashes});
+        let data = json!({"policy":policy,"source_thread_ids":sources,"units":input,"source_file_hashes":source_hashes});
         let serialized = serde_json::to_string(&data)?;
         let fingerprint = bytes_sha256(serialized.as_bytes());
         let prompt =
@@ -574,6 +603,34 @@ mod tests {
             "quote":"Executed `git lfs prune --dry-run`: 8 files would be pruned (144 MB). Actual prune was not run."}]}],"conflicts":[]})
     }
     #[test]
+    fn claude_review_groups_projects_and_requires_independent_original_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        for project in ["one", "two"] {
+            let root = temp.path().join(format!("projects/{project}/memory"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("note.md"), "---\nname: note\ndescription: facts\n---\nActual apply was not run; only preview completed.\n").unwrap();
+            fs::write(
+                root.join("MEMORY.md"),
+                "- [note](note.md) — Apply completed.\n",
+            )
+            .unwrap();
+        }
+        fs::write(temp.path().join("projects/one/session.jsonl"), "not memory").unwrap();
+        let (files, mut data) = collect(temp.path()).unwrap();
+        assert_eq!(files.len(), 4);
+        assert_eq!(components(&data).len(), 2);
+        let leaf = "claude_leaf:projects/one/memory/note.md";
+        let index = "claude_index:projects/one/memory/MEMORY.md";
+        let answer = json!({"input_sha256":"hash","edits":[{"unit":index,"before":"Apply completed.","after":"Only preview completed.","evidence":[{"unit":leaf,"quote":"Actual apply was not run; only preview completed."}]}],"conflicts":[]});
+        assert!(validate_answer(&answer.to_string(), "hash", &data).is_err());
+        data.get_mut(leaf).unwrap().writable = false;
+        let result = validate_answer(&answer.to_string(), "hash", &data)
+            .unwrap()
+            .unwrap();
+        assert!(result[index].contains("Only preview completed."));
+    }
+
+    #[test]
     fn corrects_execution_status_with_independent_verbatim_evidence() {
         let source = units();
         let result = validate_answer(&answer().to_string(), "hash", &source)
@@ -638,6 +695,110 @@ mod tests {
         data.get_mut("catalog").unwrap().sources.insert(id.into());
         assert_eq!(components(&data).len(), 1);
     }
+    #[cfg(unix)]
+    #[test]
+    fn claude_review_uses_original_evidence_and_reuses_only_matching_policy() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        let evidence = temp.path().join("original");
+        let index = "projects/project/memory/MEMORY.md";
+        let leaf = "projects/project/memory/note.md";
+        for root in [&stage, &evidence] {
+            fs::create_dir_all(root.join("projects/project/memory")).unwrap();
+            fs::write(root.join(leaf), "---\nname: note\ndescription: facts\n---\nActual apply was not run; only preview completed.\n").unwrap();
+            fs::write(root.join(index), "- [note](note.md) — Apply completed.\n").unwrap();
+        }
+        let command = temp.path().join("reviewer");
+        fs::write(&command, r#"#!/usr/bin/env python3
+import json,pathlib,sys
+prompt=sys.stdin.read();data=json.loads(prompt.split('Input JSON:\n')[1]);fingerprint=prompt.split('Input fingerprint: ')[1].split('\n')[0]
+assert data['policy']=='claude-project-memory-consistency-v1'
+u=data['units'];idx=next(v for v in u.values() if v['kind']=='claude_index');source=next(v for v in u.values() if v['kind']=='claude_leaf' and not v['writable'])
+answer={'input_sha256':fingerprint,'edits':[{'unit':idx['id'],'before':'Apply completed.','after':'Only preview completed.','evidence':[{'unit':source['id'],'quote':'Actual apply was not run; only preview completed.'}]}],'conflicts':[]}
+pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text(json.dumps(answer))
+"#).unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = MergeConfig {
+            backend: Backend::Codex,
+            command: Some(command),
+            ..Default::default()
+        };
+        let protected = review_with_protected(
+            &stage,
+            &config,
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::from([index.into()]),
+            &[&evidence],
+        )
+        .unwrap();
+        assert!(protected.blocker.is_some());
+        assert!(
+            fs::read_to_string(stage.join(index))
+                .unwrap()
+                .contains("Apply completed.")
+        );
+        let result = review_with_protected(
+            &stage,
+            &config,
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[&evidence],
+        )
+        .unwrap();
+        assert!(result.checked);
+        assert_eq!(result.corrected, 1);
+        assert!(
+            fs::read_to_string(evidence.join(index))
+                .unwrap()
+                .contains("Apply completed.")
+        );
+        let scope = crate::memory_merge::Scope::new(
+            crate::memory_merge::Endpoint::new("a".repeat(64), &stage).unwrap(),
+            crate::memory_merge::Endpoint::new("b".repeat(64), &evidence).unwrap(),
+            crate::core::ResourceSelection::Memory,
+        )
+        .unwrap();
+        let mut baseline = Baseline::capture_agent(
+            "claude",
+            scope,
+            "c".repeat(64),
+            &stage,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        baseline
+            .set_review_policy(Some(CLAUDE_POLICY.into()))
+            .unwrap();
+        config.command = Some(temp.path().join("must-not-run"));
+        let reused = review_with_protected(
+            &stage,
+            &config,
+            Some(&baseline),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[&evidence],
+        )
+        .unwrap();
+        assert!(reused.checked);
+        assert_eq!(reused.corrected, 0);
+        fs::write(evidence.join(leaf), "Changed independent evidence.\n").unwrap();
+        assert!(
+            review_with_protected(
+                &stage,
+                &config,
+                Some(&baseline),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &[&evidence]
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn legacy_baseline_is_reviewed_and_matching_review_can_be_reused() {

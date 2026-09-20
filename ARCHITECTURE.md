@@ -126,7 +126,7 @@ until migration is complete. Unknown headers retain full-record comparison, and
 active exclusions still take precedence. No migration subprocess runs during
 planning or apply; format conversion stays outside the sync transaction.
 
-Codex catalog repair is a typed, root-scoped helper operation (protocol 7).
+Codex catalog repair is a typed, root-scoped helper operation (protocol 8).
 Explicit thread/read calls repair missing rows that list scans can omit. It runs
 after both endpoint backups and journal publication, while endpoint locks remain
 held, and before final manifest verification and the verified journal phase.
@@ -187,4 +187,28 @@ original source-file versions are included in request fingerprints and cache
 eligibility, and prior active exclusions force review when those sources become
 eligible. Both endpoint copies are independently read back before publication;
 only a verified journal permits saving the marker. Policy changes require a new
-review version. Protocol 7 ensures helper agreement on these semantics.
+review version. Protocol 8 ensures helper agreement on these semantics.
+
+Claude now shares the paired Markdown baseline machinery, with an explicit agent
+namespace and separately checksummed deferred-project set. Legacy Codex baseline
+serialization and digests remain unchanged. Typed baseline reads/publication
+validate the agent and matching verified journal; protocol 8 also carries Claude
+activity and project exclusions. Claude no longer marks journals verified before
+content and event-mtime verification.
+
+Claude activity comes from live PID/session registry entries and NUL-delimited
+lsof access/path fields. Missing registry support falls back to observed file
+writers; failed inspection and unattributed root writers refuse the operation.
+Active IDs are unioned across peers and mapped back to their project aliases.
+Whole bundles and affected project shared data are excluded on both endpoints.
+Immutable selected local copies isolate planning/editor/model input from live
+files. Selected-file backups omit deferred data, and fresh activity checks reject
+new writers instead of widening exclusions under an existing plan. Archive
+imports retain a full-root writer gate. There is no mtime-based inactivity cutoff.
+
+Claude automatic body/index/preamble merges use the shared resolver with a
+verified base. Optional cross-file review groups allowlisted memory by project,
+accepts evidence only from original leaf snapshots, validates bounded changes,
+and protects explicit manual choices. It uses its own versioned review policy;
+review reuse requires unchanged staged content and original evidence. Neither
+skills nor credentials enter inventories, baselines, or review inputs.

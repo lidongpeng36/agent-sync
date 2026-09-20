@@ -104,12 +104,12 @@ fn memory_basis(
     resources: ResourceSelection,
 ) -> Result<MemoryBasis> {
     let peer = Endpoint::new(local_node.to_owned(), local)?;
-    let view: memory_merge::View =
-        transport.remote_request(&RemoteRequest::CodexMemoryBaseline {
-            root: remote_root.to_owned(),
-            peer: peer.clone(),
-            resources,
-        })?;
+    let view: memory_merge::View = transport.remote_request(&RemoteRequest::MemoryBaseline {
+        agent: "codex".into(),
+        root: remote_root.to_owned(),
+        peer: peer.clone(),
+        resources,
+    })?;
     let other = view
         .scope
         .endpoints
@@ -219,6 +219,7 @@ impl Adapter for CodexAdapter {
                 agent: "codex".to_owned(),
                 resources: options.resources,
                 excluded_ids: active.iter().cloned().collect(),
+                excluded_projects: Vec::new(),
                 peer_id: local_node_id.clone(),
             })?;
         let transfer = inventory_transfer_paths(&local_inventory, &remote_inventory);
@@ -474,6 +475,7 @@ impl Adapter for CodexAdapter {
                 agent: "codex".to_owned(),
                 resources: value.resources,
                 excluded_ids: value.active.iter().cloned().collect(),
+                excluded_projects: Vec::new(),
                 peer_id: value.local_node_id.clone(),
             })?;
         if current_remote.generation != value.remote_fingerprint {
@@ -567,6 +569,7 @@ impl Adapter for CodexAdapter {
                 agent: "codex".to_owned(),
                 resources: value.resources,
                 excluded_ids: value.active.iter().cloned().collect(),
+                excluded_projects: Vec::new(),
                 peer_id: value.local_node_id.clone(),
             })?;
         verify_remote_inventory(
@@ -604,7 +607,8 @@ impl Adapter for CodexAdapter {
             if actual != baseline {
                 bail!("local memory baseline differs from verified result");
             }
-            let _: Value = transport.remote_request(&RemoteRequest::SaveCodexMemoryBaseline {
+            let _: Value = transport.remote_request(&RemoteRequest::SaveMemoryBaseline {
+                agent: "codex".into(),
                 root: remote_root.to_owned(),
                 baseline: baseline.clone(),
             })?;

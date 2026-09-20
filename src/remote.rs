@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,14 +46,18 @@ pub enum Request {
         resources: ResourceSelection,
         #[serde(default)]
         excluded_ids: Vec<String>,
+        #[serde(default)]
+        excluded_projects: Vec<String>,
         peer_id: String,
     },
-    CodexMemoryBaseline {
+    MemoryBaseline {
+        agent: String,
         root: String,
         peer: crate::memory_merge::Endpoint,
         resources: ResourceSelection,
     },
-    SaveCodexMemoryBaseline {
+    SaveMemoryBaseline {
+        agent: String,
         root: String,
         baseline: crate::memory_merge::Baseline,
     },
@@ -77,6 +81,10 @@ pub enum Request {
     ClaudeMtimes {
         root: String,
         include_memory: bool,
+    },
+    ClaudeActivity {
+        root: String,
+        session_ids: Vec<String>,
     },
     ClaudeWriters {
         root: String,
@@ -258,29 +266,38 @@ fn dispatch(request: Request) -> Result<Value> {
             agent,
             resources,
             excluded_ids,
+            excluded_projects,
             peer_id,
         } => {
             let root = expand_root(&root)?;
+            let activity = crate::adapters::claude_activity::Activity {
+                sessions: excluded_ids.iter().cloned().collect(),
+                projects: excluded_projects.into_iter().collect(),
+            };
+            activity.validate()?;
             let state_root = crate::state::default_state_root()?;
             let previous = crate::state::load(&state_root, &agent, &peer_id, resources)?;
             let (value, _) = inventory_cached(
                 &root,
                 |path| {
                     inventory_excluded(&agent, resources, path)
-                        || excluded_ids
-                            .iter()
-                            .any(|id| path.to_string_lossy().contains(id))
-                        || (!excluded_ids.is_empty()
-                            && matches!(
-                                path.to_string_lossy().as_ref(),
-                                "history.jsonl" | "session_index.jsonl"
-                            ))
+                        || (agent == "claude" && activity.excludes(path))
+                        || (agent != "claude"
+                            && excluded_ids
+                                .iter()
+                                .any(|id| path.to_string_lossy().contains(id))
+                            || (!excluded_ids.is_empty()
+                                && matches!(
+                                    path.to_string_lossy().as_ref(),
+                                    "history.jsonl" | "session_index.jsonl"
+                                )))
                 },
                 previous.as_ref().map(|value| &value.inventory),
             )?;
             Ok(serde_json::to_value(value)?)
         }
-        Request::CodexMemoryBaseline {
+        Request::MemoryBaseline {
+            agent,
             root,
             peer,
             resources,
@@ -291,14 +308,22 @@ fn dispatch(request: Request) -> Result<Value> {
             )?;
             let scope = crate::memory_merge::Scope::new(endpoint, peer, resources)?;
             let baseline =
-                crate::memory_merge::load(&crate::memory_merge::storage_root()?, &scope)?;
+                crate::memory_merge::load(&crate::memory_merge::storage_root_for(&agent)?, &scope)?
+                    .filter(|b| b.agent == agent);
             Ok(serde_json::to_value(crate::memory_merge::View {
                 scope,
                 baseline,
             })?)
         }
-        Request::SaveCodexMemoryBaseline { root, baseline } => {
+        Request::SaveMemoryBaseline {
+            agent,
+            root,
+            baseline,
+        } => {
             baseline.validate()?;
+            if baseline.agent != agent {
+                bail!("baseline agent mismatch");
+            }
             let root = fs::canonicalize(expand_root(&root)?)?;
             let endpoint = crate::memory_merge::Endpoint::new(
                 crate::state::node_id(&crate::state::default_state_root()?)?,
@@ -308,21 +333,23 @@ fn dispatch(request: Request) -> Result<Value> {
                 bail!("memory baseline remote root/node mismatch");
             }
             let journal =
-                crate::state::load_transaction(&crate::state::default_state_root()?, "codex")?
+                crate::state::load_transaction(&crate::state::default_state_root()?, &agent)?
                     .context("memory baseline requires a verified transaction")?;
             // Independently read back all eligible files; do not accept coordinator text blindly.
-            let mut actual = crate::memory_merge::Baseline::capture_excluding(
+            let mut actual = crate::memory_merge::Baseline::capture_agent(
+                &agent,
                 baseline.scope.clone(),
                 baseline.transaction_id.clone(),
                 &root,
                 &baseline.excluded_ids,
+                &baseline.excluded_projects,
             )?;
             actual.set_review_policy(baseline.review_policy.clone())?;
             if actual != baseline {
                 bail!("remote memory baseline content differs from verified result");
             }
             crate::memory_merge::save_verified(
-                &crate::memory_merge::storage_root()?,
+                &crate::memory_merge::storage_root_for(&agent)?,
                 &baseline,
                 &journal,
             )?;
@@ -366,6 +393,14 @@ fn dispatch(request: Request) -> Result<Value> {
             &expand_root(&root)?,
             include_memory,
         )?)?),
+        Request::ClaudeActivity { root, session_ids } => {
+            let root = expand_root(&root)?;
+            let mut activity = crate::adapters::claude_activity::detect(&root)?;
+            activity.sessions.extend(session_ids);
+            activity.validate()?;
+            crate::adapters::claude_activity::map_projects(&root, &mut activity)?;
+            Ok(serde_json::to_value(activity)?)
+        }
         Request::ClaudeWriters { root } => Ok(serde_json::json!({
             "active": claude_writers(&expand_root(&root)?)?,
         })),
@@ -595,24 +630,7 @@ fn claude_mtimes(root: &Path, include_memory: bool) -> Result<BTreeMap<String, i
 }
 
 fn claude_writers(root: &Path) -> Result<bool> {
-    let output = Command::new("lsof")
-        .args(["-Fpf", "+D"])
-        .arg(root.join("projects"))
-        .output()
-        .context("run remote lsof")?;
-    let mut current = false;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.starts_with('p') {
-            current = true;
-        } else if current
-            && line.starts_with('f')
-            && line[1..].chars().take_while(char::is_ascii_digit).count() > 0
-            && line.chars().any(|c| c == 'w' || c == 'u')
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    crate::adapters::claude::local_has_writers(root)
 }
 
 pub(crate) fn set_mtimes(root: &Path, items: &[MtimeUpdate]) -> Result<()> {
