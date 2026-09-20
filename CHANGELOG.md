@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0
+
+- Automatically defer Claude active session bundles and affected project memory/shared indexes, using live process registries and actual lsof access fields. Preserve writer rechecks, selected backups, stale-plan checks, and recovery gates.
+- Align Claude memory with verified paired baselines, conservative three-way merges, localized editing, and optional evidence-backed project consistency review. Index entries and preambles participate in merging.
+- Mark Claude journals verified only after final content and timestamp verification; publish memory baselines only from matching verified transactions.
+- Helper protocol 8 adds Claude activity/project exclusions and agent-scoped baseline operations. Existing Codex baseline files remain compatible.
+
 ## 0.8.1
 
 ### Codex migration guidance
