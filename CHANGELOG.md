@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.1
+
+### Codex migration guidance
+
+- Detect legacy/paginated history mismatches, including both missing and explicit legacy markers, and report affected endpoint counts and synchronized roots.
+- Stop before interactive content choices when migration is required. Explicit local/remote strategies and `--yes` cannot bypass the migration gate.
+- Explain official `codex migrate-rollouts` inspection and migration, including scoped `--thread` batches and checking both endpoints for whole-root migration. Migration is never run automatically by sync.
+
+### Session timestamp convergence
+
+- Reapply only planned session JSONL timestamps after transport and catalog repair, guarded by content checksums.
+- Verify timestamps alongside the full content manifest before marking a transaction verified, preventing a successful apply from leaving metadata-only changes for the next preview.
+- Preserve active-session exclusions, two-endpoint backups, transaction recovery gates, and helper protocol 7 compatibility.
+
+### Validation
+
+- Passed 106 unit tests and 11 CLI integration tests, formatting, and Clippy.
+- In isolated copies of 281 conflicting sessions, official Codex migration produced 280 equivalent histories and one strict append. The subsequent sync converged with matching content and timestamps, zero changes on a second preview, and full checkpoint reuse.
+
 ## 0.8.0
 
 ### Memory merging
