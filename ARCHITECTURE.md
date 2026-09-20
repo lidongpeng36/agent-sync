@@ -119,6 +119,12 @@ All other fields remain significant. Equivalent inputs choose a deterministic
 original byte stream; strict extensions retain the full extending stream.
 Legacy/paginated conversions remain the responsibility of official Codex
 migration tooling. Source inventories and final manifests remain byte-exact.
+Known legacy/paginated pairs are migration blockers, independent of conflict
+strategy. The coordinator reports affected endpoint counts and real synchronized
+roots with official inspection/apply instructions; it skips interactive choices
+until migration is complete. Unknown headers retain full-record comparison, and
+active exclusions still take precedence. No migration subprocess runs during
+planning or apply; format conversion stays outside the sync transaction.
 
 Codex catalog repair is a typed, root-scoped helper operation (protocol 7).
 Explicit thread/read calls repair missing rows that list scans can omit. It runs
@@ -129,6 +135,11 @@ Sparse payload copies preserve staged mtimes. Codex stages portable whole-second
 rollout mtimes and stable aggregate-file mtimes to converge with protocol 29
 rsync. Local installation and remote pushes always use checksums so equal sizes
 and mtimes cannot hide selected content changes.
+After catalog repair, Codex reasserts only planned session JSONL mtimes through
+the shared checksum-guarded setter and existing typed SetMtimes operation.
+Final verification checks session mtimes as well as the full content manifest
+before marking journals verified, preventing a successful apply from leaving
+metadata-only work for the next preview. Active-excluded paths are never selected.
 
 Memory resolution is configured globally or per adapter in memory_resolver.
 Builtin operation needs no agent or network: paired baseline diff3 first, or

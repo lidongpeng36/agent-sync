@@ -233,10 +233,32 @@ strict extensions select the complete longer history. True divergence still
 requires a choice. Staging and final verification continue to use exact bytes.
 Both local install and remote push use rsync checksums, including
 equal-size/equal-mtime changes.
+Planned session timestamps are reapplied with checksum guards after catalog
+repair, and final verification checks timestamps as well as content so a
+successful apply does not leave metadata-only changes for the next preview.
 
 Legacy-to-paginated history conversion is not a formatting-only change. Complete
 that conversion with Codex's own migration tooling before comparing mixed
 formats; agent-sync does not discard legacy events to manufacture equivalence.
+When the same session is legacy on one endpoint and paginated on the other,
+preview reports a **history format mismatch**, summarizes the affected sides,
+and identifies their synchronized roots. Apply stops before interactive choices;
+`-s local`, `-s remote`, and `--yes` do not bypass this migration gate.
+
+For whole-root migration, on **both endpoints** set `CODEX_HOME` to the synchronized
+root (including any custom `--local-root` or `--remote-root`), then inspect with
+`codex migrate-rollouts`. This command is read-only without `--apply`. Back up
+the roots and finish active writers before running `codex migrate-rollouts --apply`
+on both endpoints. Migrating only one entire root can introduce new mismatches
+for other previously matching legacy sessions. Alternatively, add
+`--thread <THREAD_ID>` to inspection and apply on each blocker's legacy endpoint
+to restrict migration to those conflicts; repeat `--thread` to batch IDs.
+Update Codex first if that command is unavailable. Rerun the sync preview after
+migration and review any remaining content conflicts. A successful migration
+does not by itself prove that two histories are equal. Agent-sync never invokes
+the migration automatically, so preview remains read-only and migration cannot
+silently bypass the two-endpoint sync transaction.
+
 Catalog repair uses root-scoped official `thread/read` calls after backup and
 journal publication, before final verification. It does not resume threads.
 

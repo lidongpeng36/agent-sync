@@ -3,11 +3,11 @@ use crate::core::{
     Blocker, ConflictStrategy, EditDocument, InteractiveChoice, PayloadSide, PlanReport,
     ResourceSelection, SyncOptions, build_sparse_payload, bytes_sha256, choose_interactively,
     complete_remote_view, edit_conflict_documents, file_lock_is_held, inventory, inventory_cached,
-    inventory_transfer_paths, manifest, planned_file_changes, print_planned_diff, private_dir,
+    inventory_transfer_paths, planned_file_changes, print_planned_diff, private_dir,
     seed_remote_deltas, stamp,
 };
 use crate::memory_merge::{self, Baseline, Endpoint, Scope};
-use crate::remote::{BackupKind, Request as RemoteRequest, StateTimes, create_backup};
+use crate::remote::{BackupKind, MtimeUpdate, Request as RemoteRequest, StateTimes, create_backup};
 use crate::transport::{RemoteGuard, SshTransport};
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
@@ -38,6 +38,22 @@ struct Session {
     lines: Vec<Vec<u8>>,
     record_hashes: Vec<String>,
     times: Times,
+    history_format: Option<HistoryFormat>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryFormat {
+    Legacy,
+    Paginated,
+}
+
+impl HistoryFormat {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Paginated => "paginated",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -48,6 +64,8 @@ struct CodexConflict {
     remote_relative: PathBuf,
     local_bytes: Vec<u8>,
     remote_bytes: Vec<u8>,
+    // A format conversion must use official migration, never a whole-file choice.
+    migration: Option<(HistoryFormat, HistoryFormat)>,
 }
 
 pub struct CodexPrepared {
@@ -235,6 +253,7 @@ impl Adapter for CodexAdapter {
             common_base.as_ref(),
             &options.memory_merge,
         )?;
+        add_migration_guidance(&mut report, &conflicts, local, remote_root);
         let memory_reviewed = review_staged_memory(
             &stage,
             options.resources,
@@ -314,7 +333,13 @@ impl Adapter for CodexAdapter {
         let Prepared::Codex(value) = prepared else {
             bail!("adapter/prepared plan mismatch");
         };
-        if value.conflicts.is_empty() || !tty {
+        if value.conflicts.is_empty()
+            || !tty
+            || value
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.migration.is_some())
+        {
             return Ok(());
         }
         let mut edited = BTreeSet::new();
@@ -484,6 +509,10 @@ impl Adapter for CodexAdapter {
             remote_state(transport, remote_root, &stamp, "backup", None)?;
         }
         let result_inventory = inventory(&value.stage, exclude)?;
+        let local_mtimes =
+            planned_session_mtimes(&result_inventory, &value.report.files, PayloadSide::Local);
+        let remote_mtimes =
+            planned_session_mtimes(&result_inventory, &value.report.files, PayloadSide::Remote);
         let mut journal = crate::state::TransactionJournal::new(
             "codex",
             value.resources,
@@ -520,6 +549,16 @@ impl Adapter for CodexAdapter {
             println!(
                 "catalog: local={local_count}, remote={remote_count}; times repaired: local={local_changed}, remote={remote_changed}"
             );
+        }
+        // Content verification alone cannot prove convergence of metadata-only
+        // changes. Reassert only planned mtimes after transport and catalog work,
+        // with the same checksum guard as the typed remote operation.
+        crate::remote::set_mtimes(local, &local_mtimes)?;
+        if !remote_mtimes.is_empty() {
+            let _: Value = transport.remote_request(&RemoteRequest::SetMtimes {
+                root: remote_root.to_owned(),
+                items: remote_mtimes,
+            })?;
         }
         verify_selected(&value.stage, local, value.resources, &value.active, "local")?;
         let verified_remote: crate::core::Inventory =
@@ -736,6 +775,7 @@ fn scan_sessions(root: &Path, active: &BTreeSet<String>) -> Result<BTreeMap<Stri
                     Session {
                         relative: rel,
                         record_hashes: semantic_record_hashes(&lines)?,
+                        history_format: history_format(&lines)?,
                         lines,
                         times,
                     },
@@ -748,6 +788,59 @@ fn scan_sessions(root: &Path, active: &BTreeSet<String>) -> Result<BTreeMap<Stri
     }
     Ok(out)
 }
+
+fn history_format(lines: &[Vec<u8>]) -> Result<Option<HistoryFormat>> {
+    let first: Value = serde_json::from_slice(lines.first().context("empty rollout")?)?;
+    // Unknown or inconsistent headers retain the normal full-record comparison.
+    Ok(
+        match (first.pointer("/payload/history_mode"), first.get("ordinal")) {
+            (None, None) => Some(HistoryFormat::Legacy),
+            (Some(mode), None) if mode == "legacy" => Some(HistoryFormat::Legacy),
+            (Some(mode), Some(ordinal)) if mode == "paginated" && ordinal == 0 => {
+                Some(HistoryFormat::Paginated)
+            }
+            _ => None,
+        },
+    )
+}
+
+fn add_migration_guidance(
+    report: &mut PlanReport,
+    conflicts: &[CodexConflict],
+    local: &Path,
+    remote_root: &str,
+) {
+    let mut local_legacy = 0;
+    let mut remote_legacy = 0;
+    for conflict in conflicts {
+        if let Some((left, right)) = conflict.migration {
+            local_legacy += usize::from(left == HistoryFormat::Legacy);
+            remote_legacy += usize::from(right == HistoryFormat::Legacy);
+        }
+    }
+    if local_legacy + remote_legacy == 0 {
+        return;
+    }
+    report.notes.push(format!(
+        "Codex history migration required: {} mixed-format sessions (local legacy={local_legacy}, remote legacy={remote_legacy}); synchronization is blocked before conflict choices, including local/remote strategies",
+        local_legacy + remote_legacy,
+    ));
+    report.notes.push(format!(
+        "migration root: local endpoint, CODEX_HOME set to synchronized root {}",
+        local.display()
+    ));
+    report.notes.push(format!(
+        "migration root: remote endpoint {}, CODEX_HOME set to synchronized root {remote_root} (resolve relative roots from that endpoint's home directory)",
+        report.peer
+    ));
+    report.notes.push(
+        "For whole-root migration, inspect BOTH endpoints with `codex migrate-rollouts`; after backing up the roots and finishing active writers, run `codex migrate-rollouts --apply` on both. Migrating only one entire root can introduce mismatches for other previously matching legacy sessions. If unavailable, update Codex first".into(),
+    );
+    report.notes.push(
+        "For a scoped migration, add `--thread <THREAD_ID>` for each blocker on its legacy endpoint (repeat --thread to batch). Then rerun the sync preview; remaining content differences still require review. agent-sync does not run migration automatically".into(),
+    );
+}
+
 fn split_lines(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     for line in bytes.split_inclusive(|b| *b == b'\n') {
@@ -947,6 +1040,29 @@ fn build_stage_with_merge_config(
                     });
                     continue;
                 }
+                (Some(x), Some(y)) if matches!((x.history_format, y.history_format), (Some(a), Some(b)) if a != b) =>
+                {
+                    let left = x.history_format.expect("known history format");
+                    let right = y.history_format.expect("known history format");
+                    conflicts.push(CodexConflict {
+                        resource: "session",
+                        key: id.clone(),
+                        local_relative: x.relative.clone(),
+                        remote_relative: y.relative.clone(),
+                        local_bytes: x.lines.concat(),
+                        remote_bytes: y.lines.concat(),
+                        migration: Some((left, right)),
+                    });
+                    report.blockers.push(Blocker {
+                        resource: "sessions".into(),
+                        path: id.clone(),
+                        reason: format!(
+                            "Codex history format mismatch: local={}, remote={}; official migration required before synchronization",
+                            left.name(), right.name()
+                        ),
+                    });
+                    continue;
+                }
                 (Some(x), Some(y)) if x.record_hashes == y.record_hashes => {
                     report.identical += 1;
                     // Stable across endpoint order, without inventing rollout bytes.
@@ -971,6 +1087,7 @@ fn build_stage_with_merge_config(
                             remote_relative: y.relative.clone(),
                             local_bytes: x.lines.concat(),
                             remote_bytes: y.lines.concat(),
+                            migration: None,
                         });
                         report.blockers.push(Blocker {
                             resource: "sessions".into(),
@@ -1268,6 +1385,7 @@ fn merge_codex_memory(
                             remote_relative: relative,
                             local_bytes: lb,
                             remote_bytes: rb,
+                            migration: None,
                         });
                         report.blockers.push(Blocker {
                             resource: "memory".into(),
@@ -1460,12 +1578,9 @@ fn verify_selected(
     side: &str,
 ) -> Result<()> {
     let exclude = |p: &Path| excluded(p, r) || active_excluded_path(p, active);
-    let a = manifest(stage, exclude)?;
-    let b = manifest(actual, exclude)?;
-    if a != b {
-        bail!("{side} final file set or content differs from the staged manifest");
-    }
-    Ok(())
+    let a = inventory(stage, exclude)?;
+    let b = inventory(actual, exclude)?;
+    verify_final_inventory(&a, &b, side)
 }
 
 fn verify_remote_inventory(
@@ -1477,8 +1592,62 @@ fn verify_remote_inventory(
     let expected = inventory(stage, |path| {
         excluded(path, resources) || active_excluded_path(path, active)
     })?;
+    verify_final_inventory(&expected, actual, "remote")
+}
+
+fn session_jsonl(path: &str) -> bool {
+    path.ends_with(".jsonl")
+        && (path.starts_with("sessions/")
+            || path.starts_with("archived_sessions/")
+            || matches!(path, "history.jsonl" | "session_index.jsonl"))
+}
+
+fn planned_session_mtimes(
+    result: &crate::core::Inventory,
+    files: &[crate::core::FileChange],
+    side: PayloadSide,
+) -> Vec<MtimeUpdate> {
+    let selected: BTreeSet<&str> = files
+        .iter()
+        .filter(|file| {
+            session_jsonl(&file.path)
+                && match side {
+                    PayloadSide::Local => file.local != crate::core::FileAction::Unchanged,
+                    PayloadSide::Remote => file.remote != crate::core::FileAction::Unchanged,
+                }
+        })
+        .map(|file| file.path.as_str())
+        .collect();
+    result
+        .entries
+        .iter()
+        .filter(|entry| selected.contains(entry.path.as_str()))
+        .map(|entry| MtimeUpdate {
+            path: entry.path.clone(),
+            sha256: entry.sha256.clone(),
+            mtime_ns: entry.modified_ns,
+        })
+        .collect()
+}
+
+fn verify_final_inventory(
+    expected: &crate::core::Inventory,
+    actual: &crate::core::Inventory,
+    side: &str,
+) -> Result<()> {
     if expected.content_manifest() != actual.content_manifest() {
-        bail!("remote final file set or content differs from the staged manifest");
+        bail!("{side} final file set or content differs from the staged manifest");
+    }
+    let actual = actual.by_path();
+    for entry in &expected.entries {
+        if session_jsonl(&entry.path)
+            && actual[entry.path.as_str()].modified_ns != entry.modified_ns
+        {
+            bail!(
+                "{side} final session mtime differs from the staged manifest: {}",
+                entry.path
+            );
+        }
     }
     Ok(())
 }
@@ -1647,6 +1816,177 @@ mod tests {
     fn prefix_is_strict() {
         assert!(prefix(&[b"a".to_vec()], &[b"a".to_vec(), b"b".to_vec()]));
         assert!(!prefix(&[b"a".to_vec()], &[b"a".to_vec()]));
+    }
+
+    #[test]
+    fn session_mtime_verification_and_correction_are_scoped_and_hash_guarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        let local = temp.path().join("local");
+        let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        let staged = write_rollout(&stage, id, "same");
+        let installed = write_rollout(&local, id, "same");
+        filetime::set_file_mtime(&staged, filetime::FileTime::from_unix_time(1700000000, 0))
+            .unwrap();
+        filetime::set_file_mtime(
+            &installed,
+            filetime::FileTime::from_unix_time(1700000042, 0),
+        )
+        .unwrap();
+        let result = inventory(&stage, |_| false).unwrap();
+        let actual = inventory(&local, |_| false).unwrap();
+        assert_eq!(result.content_manifest(), actual.content_manifest());
+        assert!(
+            verify_final_inventory(&result, &actual, "local")
+                .unwrap_err()
+                .to_string()
+                .contains("mtime")
+        );
+        let files = planned_file_changes(&local, &stage, &stage, |_| false).unwrap();
+        let corrections = planned_session_mtimes(&result, &files, PayloadSide::Local);
+        assert_eq!(corrections.len(), 1);
+        assert!(planned_session_mtimes(&result, &files, PayloadSide::Remote).is_empty());
+        crate::remote::set_mtimes(&local, &corrections).unwrap();
+        verify_selected(
+            &stage,
+            &local,
+            ResourceSelection::Sessions,
+            &BTreeSet::new(),
+            "local",
+        )
+        .unwrap();
+        assert!(
+            planned_file_changes(&local, &stage, &stage, |_| false)
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(&installed, b"content changed after planning\n").unwrap();
+        let modified = fs::metadata(&installed).unwrap().modified().unwrap();
+        assert!(crate::remote::set_mtimes(&local, &corrections).is_err());
+        assert_eq!(
+            fs::metadata(&installed).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn history_format_does_not_guess_unknown_or_inconsistent_headers() {
+        let classify =
+            |header: Value| history_format(&[serde_json::to_vec(&header).unwrap()]).unwrap();
+        assert_eq!(
+            classify(json!({"type":"session_meta", "payload":{}})),
+            Some(HistoryFormat::Legacy)
+        );
+        assert_eq!(
+            classify(json!({"type":"session_meta", "payload":{"history_mode":"legacy"}})),
+            Some(HistoryFormat::Legacy)
+        );
+        assert_eq!(
+            classify(json!({"type":"session_meta", "ordinal":0,
+                "payload":{"history_mode":"paginated"}})),
+            Some(HistoryFormat::Paginated)
+        );
+        for header in [
+            json!({"payload":{"history_mode":"future"}}),
+            json!({"ordinal":0, "payload":{}}),
+            json!({"ordinal":0, "payload":{"history_mode":"legacy"}}),
+            json!({"payload":{"history_mode":"paginated"}}),
+            json!({"payload":{"history_mode":null}}),
+        ] {
+            assert_eq!(classify(header), None);
+        }
+    }
+
+    #[test]
+    fn mixed_history_requires_migration_for_every_strategy_and_respects_active_exclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("local");
+        let remote = temp.path().join("remote");
+        let id = "019fe9a3-6ea4-71e1-bfce-ddfc8243ef05";
+        let lp = write_rollout(&local, id, "same");
+        let rp = write_rollout(&remote, id, "same");
+        let mut records: Vec<Value> = split_lines(&fs::read(&lp).unwrap())
+            .unwrap()
+            .iter()
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        records[0]["payload"]["history_mode"] = json!("paginated");
+        let encode =
+            |records: &[Value]| records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        let paginated = encode(&records);
+        fs::write(&lp, &paginated).unwrap();
+        records[0]["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_mode");
+        for record in &mut records {
+            record.as_object_mut().unwrap().remove("ordinal");
+        }
+        let legacy = encode(&records);
+        fs::write(&rp, &legacy).unwrap();
+        for (a, b) in [(&local, &remote), (&remote, &local)] {
+            for strategy in [
+                ConflictStrategy::Ask,
+                ConflictStrategy::Local,
+                ConflictStrategy::Remote,
+            ] {
+                let stage = tempfile::tempdir_in(temp.path()).unwrap();
+                let (mut report, _, conflicts) = build_stage(
+                    a,
+                    b,
+                    stage.path(),
+                    ResourceSelection::Sessions,
+                    &BTreeSet::new(),
+                    "peer",
+                    strategy,
+                )
+                .unwrap();
+                assert_eq!(conflicts.len(), 1);
+                assert!(conflicts[0].migration.is_some());
+                assert_eq!(report.blockers.len(), 1);
+                assert!(
+                    report.blockers[0]
+                        .reason
+                        .contains("history format mismatch")
+                );
+                assert!(!stage.path().join(lp.strip_prefix(&local).unwrap()).exists());
+                add_migration_guidance(&mut report, &conflicts, a, "custom-codex");
+                assert!(
+                    report
+                        .notes
+                        .iter()
+                        .any(|n| n.contains("codex migrate-rollouts --apply"))
+                );
+                assert!(report.notes.iter().any(|n| n.contains("BOTH endpoints")));
+                assert!(
+                    report
+                        .notes
+                        .iter()
+                        .any(|n| n.contains("--thread <THREAD_ID>"))
+                );
+                let expected = if a == &local {
+                    "remote legacy=1"
+                } else {
+                    "local legacy=1"
+                };
+                assert!(report.notes.iter().any(|n| n.contains(expected)));
+            }
+        }
+        let stage = temp.path().join("excluded");
+        let (report, _, conflicts) = build_stage(
+            &local,
+            &remote,
+            &stage,
+            ResourceSelection::Sessions,
+            &BTreeSet::from([id.to_owned()]),
+            "peer",
+            ConflictStrategy::Ask,
+        )
+        .unwrap();
+        assert!(report.blockers.is_empty());
+        assert!(conflicts.is_empty());
+        assert_eq!(fs::read_to_string(lp).unwrap(), paginated);
+        assert_eq!(fs::read_to_string(rp).unwrap(), legacy);
     }
 
     #[test]

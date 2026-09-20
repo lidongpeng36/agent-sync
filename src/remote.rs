@@ -615,7 +615,7 @@ fn claude_writers(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn set_mtimes(root: &Path, items: &[MtimeUpdate]) -> Result<()> {
+pub(crate) fn set_mtimes(root: &Path, items: &[MtimeUpdate]) -> Result<()> {
     for item in items {
         let relative = checked_relative(&item.path)?;
         let path = root.join(relative);

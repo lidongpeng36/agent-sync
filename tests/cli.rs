@@ -256,7 +256,14 @@ root = pathlib.Path(os.environ['CODEX_HOME'])
 for line in sys.stdin:
     req = json.loads(line)
     if req['method'] == 'initialize': result = {}
-    elif req['method'] == 'thread/read': result = {'thread': {'id': req['params']['threadId']}}
+    elif req['method'] == 'thread/read':
+        thread = req['params']['threadId']
+        # Simulate a runtime touching a selected rollout's mtime during repair.
+        # Final verification must cover metadata as well as exact content.
+        if thread == '019fe9a3-6ea4-71e1-bfce-ddfc8243ef05':
+            for rollout in (root/'sessions').rglob('*' + thread + '.jsonl'):
+                os.utime(rollout, (1700000000, 1700000000))
+        result = {'thread': {'id': thread}}
     else: raise RuntimeError('unexpected RPC')
     print(json.dumps({'id': req['id'], 'result': result}), flush=True)
 "#,
@@ -340,6 +347,53 @@ for line in sys.stdin:
             .output()
             .unwrap()
     };
+    // A mixed-format pair must stop before runtime/catalog work, even with an
+    // explicit whole-side policy and --yes. Migration guidance names real roots.
+    let mut legacy: Vec<Value> = advanced
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    legacy[0]["payload"]["history_mode"] = serde_json::json!("legacy");
+    for record in &mut legacy {
+        record.as_object_mut().unwrap().remove("ordinal");
+    }
+    let legacy = legacy
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    fs::write(remote.join(&rel), &legacy).unwrap();
+    for strategy in ["ask", "local", "remote"] {
+        let blocked = run(&["-f", "json", "-s", strategy, "--apply", "--yes"]);
+        assert_eq!(
+            blocked.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+        assert_eq!(plan["blockers"].as_array().unwrap().len(), 1);
+        assert!(
+            plan["blockers"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("history format mismatch")
+        );
+        let notes = plan["notes"].to_string();
+        assert!(notes.contains("remote legacy=1"));
+        assert!(notes.contains(remote.to_str().unwrap()));
+        assert!(notes.contains("codex migrate-rollouts --apply"));
+        assert_eq!(
+            fs::read_to_string(local.join(&rel)).unwrap(),
+            format!("{first}\n{setting}\n")
+        );
+        assert_eq!(fs::read_to_string(remote.join(&rel)).unwrap(), legacy);
+        for root in [&local, &remote] {
+            assert!(!root.join("catalog-root").exists());
+        }
+    }
+    // Once official migration has produced the same format, ordinary append
+    // merging, transaction verification, and a converged rerun still work.
+    fs::write(remote.join(&rel), &advanced).unwrap();
     let preview = run(&["-f", "json"]);
     assert!(
         preview.status.success(),

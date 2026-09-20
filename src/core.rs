@@ -454,14 +454,27 @@ impl PlanReport {
             .blockers
             .iter()
             .any(|blocker| blocker.reason.contains("active"));
+        let has_history_migration = self.blockers.iter().any(|blocker| {
+            blocker.resource == "sessions"
+                && blocker.reason.starts_with("Codex history format mismatch:")
+        });
         writeln!(output, "next steps:").unwrap();
-        writeln!(
-            output,
-            "  inspect full content diff: agent-sync sync {} {} -f diff",
-            self.agent, self.peer
-        )
-        .unwrap();
-        if has_choice {
+        if has_history_migration {
+            writeln!(output, "  complete official Codex migration on the endpoint roots listed above, then rerun the same sync command without --apply").unwrap();
+            writeln!(
+                output,
+                "  content choices are deferred until history formats match"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                output,
+                "  inspect full content diff: agent-sync sync {} {} -f diff",
+                self.agent, self.peer
+            )
+            .unwrap();
+        }
+        if has_choice && !has_history_migration {
             writeln!(
                 output,
                 "  resolve per conflict:      agent-sync sync {} {} --apply",
@@ -1343,6 +1356,33 @@ mod tests {
         assert!(!rendered.contains("-s ask --apply"));
         assert!(!rendered.contains("BLOCKED"));
         assert!(!rendered.contains("result=unresolved"));
+    }
+
+    #[test]
+    fn migration_guidance_takes_precedence_over_other_content_choices() {
+        let report = PlanReport {
+            agent: "codex".into(),
+            peer: "mini".into(),
+            blockers: vec![
+                Blocker {
+                    resource: "sessions".into(),
+                    path: "thread-id".into(),
+                    reason: "Codex history format mismatch: local=paginated, remote=legacy; official migration required before synchronization".into(),
+                },
+                Blocker {
+                    resource: "memory".into(),
+                    path: "memory_summary.md".into(),
+                    reason: "Codex memory requires a choice".into(),
+                },
+            ],
+            ..PlanReport::default()
+        };
+        let rendered = report.render_human();
+        assert!(rendered.contains("complete official Codex migration"));
+        assert!(rendered.contains("without --apply"));
+        assert!(!rendered.contains("resolve per conflict:"));
+        assert!(!rendered.contains("-s local"));
+        assert!(!rendered.contains("-s remote"));
     }
 
     #[test]
